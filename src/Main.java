@@ -3,6 +3,7 @@ import tests.CharCRDTTest;
 import tests.IntegrationTest;
 import tests.SpecialCaseTest;
 import tests.NetworkIntegrationTest;
+import tests.SystemIntegrationTest;
 
 import serializations.OperationSerializer;
 import operations.*;
@@ -34,6 +35,9 @@ public class Main {
         // Phase 3: Persistence tests
         testPersistence();
         testStructuralLogic();
+
+        // Phase 3: System integration tests (Member 4)
+        new SystemIntegrationTest().runAll();
     }
 
     /**

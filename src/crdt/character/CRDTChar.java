@@ -23,6 +23,10 @@ public class CRDTChar {
         this.deleted = true;
     }
 
+    public void unmarkDeleted() {
+        this.deleted = false;
+    }
+
     public boolean isDeleted() {
         return deleted;
     }

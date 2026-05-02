@@ -1,11 +1,17 @@
 package ui;
 
+import crdt.block.Block;
+import crdt.block.BlockCRDT;
+import crdt.block.BlockID;
 import crdt.character.CRDTChar;
 import crdt.character.CharId;
 import crdt.character.CharacterCRDT;
 import crdt.utils.Clock;
 import cursor.CursorTracker;
+import undoredo.UndoRedoManager;
 import java.awt.*;
+import java.awt.font.FontRenderContext;
+import java.awt.geom.Rectangle2D;
 import java.util.*;
 import java.util.List;
 import javax.swing.*;
@@ -16,9 +22,8 @@ import serializations.OperationSerializer;
 
 public class EditorPane extends JPanel {
 
-    // ─── Interfaces for Member 3 ──────────────────────────────────────────────
+    // ─── Network Sender Interface ─────────────────────────────────────────────
 
-    /** Member 3's WebSocketClient must implement this. EditorPane calls it to send messages. */
     public interface NetworkSender {
         void sendMessage(String jsonMessage);
         void connect(String serverUrl);
@@ -38,14 +43,21 @@ public class EditorPane extends JPanel {
     private boolean suppressDocumentEvents = false;
     private CharId caretCharId = null;
 
-    // Saved selection — refreshed by caret listener so bold/italic buttons
-    // can still read it after clicking the button clears the live selection.
+    // Saved selection so bold/italic buttons work even after losing focus
     private int savedSelStart = 0;
     private int savedSelEnd   = 0;
 
-    private NetworkSender networkSender;
+    // Sticky typing mode (Google Docs / Word style).
+    // Swing's internal AttributeTracker resets input attributes on every caret move,
+    // so we track the user's intent separately and re-apply it after each keystroke.
+    private boolean typingBold   = false;
+    private boolean typingItalic = false;
+    private boolean justInserted = false; // true for one caret event after each insert
 
-    // Called whenever the caret moves, so EditorWindow can update toolbar button states
+    private NetworkSender networkSender;
+    private UndoRedoManager undoRedoManager;
+
+    // Callback fired on caret moves so EditorWindow can sync toolbar button states
     private Runnable onFormattingChange;
 
     private final CursorTracker cursorTracker = new CursorTracker();
@@ -63,10 +75,10 @@ public class EditorPane extends JPanel {
 
     public EditorPane(int userID, String sessionID, boolean isEditor) {
         this.localUserID = userID;
-        this.sessionID = sessionID;
-        this.isEditor = isEditor;
-        this.crdt = new CharacterCRDT();
-        this.clock = new Clock();
+        this.sessionID   = sessionID;
+        this.isEditor    = isEditor;
+        this.crdt        = new CharacterCRDT();
+        this.clock       = new Clock();
 
         textPane = new JTextPane();
         textPane.setEditable(isEditor);
@@ -82,7 +94,6 @@ public class EditorPane extends JPanel {
         attachCaretListener();
     }
 
-    /** Updates whether the local user can edit the document. */
     public void setEditingEnabled(boolean enabled) {
         this.isEditor = enabled;
         textPane.setEditable(enabled);
@@ -95,43 +106,46 @@ public class EditorPane extends JPanel {
 
             @Override
             public void insertUpdate(DocumentEvent e) {
-                if (!isEditor || suppressDocumentEvents) return; // to block writing when viewer
+                if (!isEditor || suppressDocumentEvents) return;
                 try {
                     int offset = e.getOffset();
                     int length = e.getLength();
                     String inserted = e.getDocument().getText(offset, length);
 
-                    // Snapshot CRDT visible chars before any modifications
                     List<CRDTChar> visible = crdt.getVisibleChars();
 
                     AttributeSet inputAttrs = textPane.getInputAttributes();
-                    boolean bold = StyleConstants.isBold(inputAttrs);
+                    boolean bold   = StyleConstants.isBold(inputAttrs);
                     boolean italic = StyleConstants.isItalic(inputAttrs);
 
                     for (int i = 0; i < length; i++) {
-                        char ch = inserted.charAt(i);
-                        int pos = offset + i;
+                        char ch  = inserted.charAt(i);
+                        int  pos = offset + i;
 
                         CharId parentID = (pos == 0 || visible.isEmpty())
                                 ? null
                                 : visible.get(Math.min(pos - 1, visible.size() - 1)).id;
 
-                        int t = clock.tick();
+                        int    t  = clock.tick();
                         CharId id = new CharId(t, localUserID);
 
-                        crdt.insert(id, ch, parentID);
+                        // Newlines carry no formatting — applying bold/italic to \n shifts
+                        // the closing marker onto the next line and corrupts the export.
+                        boolean charBold   = (ch != '\n') && bold;
+                        boolean charItalic = (ch != '\n') && italic;
 
+                        // Build op first; op.apply() inserts the char AND sets bold/italic in CRDT
+                        InsertOperation op = new InsertOperation(localUserID, t, ch, parentID, charBold, charItalic);
+                        op.apply(crdt);
+
+                        if (undoRedoManager != null) undoRedoManager.recordOperation(op);
                         if (networkSender != null && networkSender.isConnected()) {
-                            InsertOperation op = new InsertOperation(localUserID, t, ch, parentID, bold, italic);
-                            System.out.println("[EditorPane] Sending insert operation: user=" + localUserID + " char='" + ch + "' clock=" + t);
                             networkSender.sendMessage(buildOperationEnvelope(op));
-                        } else {
-                            System.out.println("[EditorPane] Cannot send: networkSender is null or disconnected");
                         }
 
                         caretCharId = id;
-                        // Update snapshot so next char in the same paste uses the correct parent
                         visible = crdt.getVisibleChars();
+                        justInserted = true;
                     }
                 } catch (BadLocationException ex) {
                     ex.printStackTrace();
@@ -144,7 +158,6 @@ public class EditorPane extends JPanel {
                 int offset = e.getOffset();
                 int length = e.getLength();
 
-                // Snapshot before any CRDT deletes — CRDT still has all chars at this point
                 List<CRDTChar> visible = crdt.getVisibleChars();
 
                 for (int i = 0; i < length; i++) {
@@ -154,9 +167,12 @@ public class EditorPane extends JPanel {
                     CharId target = visible.get(idx).id;
                     crdt.delete(target);
 
+                    // Always create the op — needed for undo even when offline
+                    int t = clock.tick();
+                    DeleteOperation op = new DeleteOperation(localUserID, t, target);
+                    if (undoRedoManager != null) undoRedoManager.recordOperation(op);
                     if (networkSender != null && networkSender.isConnected()) {
-                        int t = clock.tick();
-                        networkSender.sendMessage(buildOperationEnvelope(new DeleteOperation(localUserID, t, target)));
+                        networkSender.sendMessage(buildOperationEnvelope(op));
                     }
                 }
 
@@ -168,7 +184,7 @@ public class EditorPane extends JPanel {
 
             @Override
             public void changedUpdate(DocumentEvent e) {
-                // Attribute-only changes triggered by programmatic refreshDisplay() — no CRDT action needed
+                // Attribute-only changes from refreshDisplay() — no CRDT action needed
             }
         });
     }
@@ -177,9 +193,9 @@ public class EditorPane extends JPanel {
 
     private void attachCaretListener() {
         textPane.addCaretListener(e -> {
-            // Only overwrite saved selection when the user actually has text selected.
-            // Clicking a button fires a caret event with dot==mark (no selection),
-            // which would wipe the saved range before applyFormatting can read it.
+            // Only overwrite saved selection when there is an actual selection.
+            // A button click fires a caret event with dot==mark, which would
+            // wipe the saved range before applyFormatting can read it.
             int selStart = Math.min(e.getDot(), e.getMark());
             int selEnd   = Math.max(e.getDot(), e.getMark());
             if (selStart != selEnd) {
@@ -197,39 +213,54 @@ public class EditorPane extends JPanel {
             if (networkSender != null && networkSender.isConnected()) {
                 networkSender.sendMessage(buildCursorEnvelope());
             }
+
+            // Swing's AttributeTracker fires before our listener and resets the
+            // input attributes to match the character at the new caret position.
+            // When the user just typed, we override that reset to keep typing mode.
+            // When the user clicked/moved, we adopt the character's formatting.
+            if (selStart == selEnd) {
+                MutableAttributeSet inputAttrs = textPane.getInputAttributes();
+                if (justInserted) {
+                    StyleConstants.setBold(inputAttrs, typingBold);
+                    StyleConstants.setItalic(inputAttrs, typingItalic);
+                    justInserted = false;
+                } else {
+                    typingBold   = StyleConstants.isBold(inputAttrs);
+                    typingItalic = StyleConstants.isItalic(inputAttrs);
+                }
+                // No active selection — clear stale saved range so a later B/I click
+                // cannot accidentally reformat text the user is no longer looking at.
+                savedSelStart = 0;
+                savedSelEnd   = 0;
+            }
+
             if (onFormattingChange != null) onFormattingChange.run();
         });
     }
 
     // ─── Display Refresh ─────────────────────────────────────────────────────
 
-    /** Rebuilds JTextPane from CRDT state. Call after applying any remote operation. */
     public void refreshDisplay() {
         suppressDocumentEvents = true;
         try {
             List<CRDTChar> chars = crdt.getVisibleChars();
-            StyledDocument doc = textPane.getStyledDocument();
+            StyledDocument doc   = textPane.getStyledDocument();
 
-            if (doc.getLength() > 0) {
-                doc.remove(0, doc.getLength());
-            }
+            if (doc.getLength() > 0) doc.remove(0, doc.getLength());
 
-            if (chars.isEmpty()) {
-                renderRemoteCursors();
-                return;
-            }
+            if (chars.isEmpty()) { renderRemoteCursors(); return; }
 
             StringBuilder sb = new StringBuilder();
             for (CRDTChar c : chars) sb.append(c.value);
             doc.insertString(0, sb.toString(), null);
 
-            // Apply bold/italic in batched groups for efficiency
-            int groupStart = 0;
-            boolean groupBold = chars.get(0).isBold();
+            // Apply bold/italic in batched runs for efficiency
+            int     groupStart  = 0;
+            boolean groupBold   = chars.get(0).isBold();
             boolean groupItalic = chars.get(0).isItalic();
 
             for (int i = 1; i <= chars.size(); i++) {
-                boolean curBold = (i < chars.size()) ? chars.get(i).isBold() : !groupBold;
+                boolean curBold   = (i < chars.size()) ? chars.get(i).isBold()   : !groupBold;
                 boolean curItalic = (i < chars.size()) ? chars.get(i).isItalic() : !groupItalic;
 
                 if (curBold != groupBold || curItalic != groupItalic) {
@@ -238,10 +269,7 @@ public class EditorPane extends JPanel {
                     StyleConstants.setItalic(attrs, groupItalic);
                     doc.setCharacterAttributes(groupStart, i - groupStart, attrs, true);
                     groupStart = i;
-                    if (i < chars.size()) {
-                        groupBold = curBold;
-                        groupItalic = curItalic;
-                    }
+                    if (i < chars.size()) { groupBold = curBold; groupItalic = curItalic; }
                 }
             }
 
@@ -249,10 +277,7 @@ public class EditorPane extends JPanel {
             int newPos = 0;
             if (caretCharId != null) {
                 for (int i = 0; i < chars.size(); i++) {
-                    if (chars.get(i).id.equals(caretCharId)) {
-                        newPos = i + 1;
-                        break;
-                    }
+                    if (chars.get(i).id.equals(caretCharId)) { newPos = i + 1; break; }
                 }
             }
             textPane.setCaretPosition(Math.min(newPos, doc.getLength()));
@@ -262,7 +287,6 @@ public class EditorPane extends JPanel {
         } finally {
             suppressDocumentEvents = false;
         }
-
         renderRemoteCursors();
     }
 
@@ -271,84 +295,88 @@ public class EditorPane extends JPanel {
     private void renderRemoteCursors() {
         Highlighter hl = textPane.getHighlighter();
         hl.removeAllHighlights();
-
         int docLen = textPane.getDocument().getLength();
         if (docLen == 0) return;
 
         for (Map.Entry<Integer, Integer> entry : cursorTracker.getAll().entrySet()) {
-            int uid = entry.getKey();
-            int caretPos = Math.max(0, Math.min(entry.getValue(), docLen));
-            int anchor = Math.max(0, Math.min(caretPos, docLen - 1));
-            Color c = CURSOR_COLORS[uid % CURSOR_COLORS.length];
+            int   uid      = entry.getKey();
+            int   caretPos = Math.max(0, Math.min(entry.getValue(), docLen));
+            int   anchor   = Math.max(0, Math.min(caretPos, docLen - 1));
+            Color color    = CURSOR_COLORS[uid % CURSOR_COLORS.length];
             try {
-                hl.addHighlight(anchor, anchor + 1, new CursorPainter(c, caretPos));
+                hl.addHighlight(anchor, anchor + 1,
+                        new CursorPainter(color, caretPos, "User " + uid));
             } catch (BadLocationException e) {
-                // stale cursor position — skip silently
+                // stale cursor — skip
             }
         }
     }
 
-    /** Draws a 2px vertical colored line at the character's left edge to represent a remote cursor. */
     private static class CursorPainter implements Highlighter.HighlightPainter {
-        private final Color color;
-        private final int caretPos;
+        private static final int BAR_WIDTH  = 2;
+        private static final Font LABEL_FONT = new Font("SansSerif", Font.BOLD, 10);
 
-        CursorPainter(Color color, int caretPos) {
-            this.color = color;
+        private final Color  color;
+        private final int    caretPos;
+        private final String label;
+
+        CursorPainter(Color color, int caretPos, String label) {
+            this.color    = color;
             this.caretPos = caretPos;
+            this.label    = label;
         }
 
-        @Override
-        @SuppressWarnings("deprecation")
+        @Override @SuppressWarnings("deprecation")
         public void paint(Graphics g, int p0, int p1, Shape bounds, JTextComponent c) {
             try {
                 int len = c.getDocument().getLength();
                 if (len == 0) return;
 
-                int clamped = Math.max(0, Math.min(caretPos, len));
-                Rectangle r;
-                int x;
+                // modelToView is valid for positions 0..len inclusive
+                int      clamped = Math.max(0, Math.min(caretPos, len));
+                Rectangle r      = c.modelToView(clamped);
+                if (r == null) return;
 
-                if (clamped < len) {
-                    r = c.modelToView(clamped);
-                    if (r == null) return;
-                    x = r.x;
-                } else {
-                    r = c.modelToView(len - 1);
-                    if (r == null) return;
-                    x = r.x + r.width;
-                }
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
+                                    RenderingHints.VALUE_ANTIALIAS_ON);
 
-                g.setColor(color);
-                g.fillRect(x, r.y, 2, r.height);
-            } catch (BadLocationException e) {
-                // ignore
-            }
+                // Cursor bar — 2px wide, full line height
+                g2.setColor(color);
+                g2.fillRect(r.x, r.y, BAR_WIDTH, r.height);
+
+                // Label flag above the cursor bar
+                g2.setFont(LABEL_FONT);
+                FontMetrics fm   = g2.getFontMetrics();
+                int         tw   = fm.stringWidth(label);
+                int         pad  = 3;
+                int         lw   = tw + pad * 2;
+                int         lh   = fm.getAscent() + fm.getDescent() + 2;
+                int         lx   = r.x;
+                int         ly   = r.y - lh;
+                if (ly < 0) ly = r.y + r.height;   // flip below if clipped at top
+
+                g2.setColor(color);
+                g2.fillRect(lx, ly, lw, lh);
+                g2.setColor(Color.WHITE);
+                g2.drawString(label, lx + pad, ly + fm.getAscent() + 1);
+
+                g2.dispose();
+            } catch (BadLocationException e) { /* ignore */ }
         }
     }
 
     // ─── Formatting ──────────────────────────────────────────────────────────
 
-    public void applyBold() {
-        if (!isEditor) return;
-        applyFormatting(true, false);
-    }
-
-    public void applyItalic() {
-        if (!isEditor) return;
-        applyFormatting(false, true);
-    }
+    public void applyBold()   { if (!isEditor) return; applyFormatting(true,  false); }
+    public void applyItalic() { if (!isEditor) return; applyFormatting(false, true);  }
 
     private void applyFormatting(boolean toggleBold, boolean toggleItalic) {
         int start = textPane.getSelectionStart();
         int end   = textPane.getSelectionEnd();
-        if (start == end) {
-            start = savedSelStart;
-            end   = savedSelEnd;
-        }
+        if (start == end) { start = savedSelStart; end = savedSelEnd; }
 
         if (start != end) {
-            // ── Selection exists: toggle bold/italic on the selected CRDT chars ──
             List<CRDTChar> visible  = crdt.getVisibleChars();
             List<CRDTChar> selected = new ArrayList<>();
             for (int i = start; i < end && i < visible.size(); i++) selected.add(visible.get(i));
@@ -364,51 +392,83 @@ public class EditorPane extends JPanel {
             }
             refreshDisplay();
         } else {
-            // ── No selection: toggle the input attributes so the next typed chars are bold/italic ──
-            javax.swing.text.MutableAttributeSet inputAttrs = textPane.getInputAttributes();
-            if (toggleBold)   StyleConstants.setBold  (inputAttrs, !StyleConstants.isBold  (inputAttrs));
-            if (toggleItalic) StyleConstants.setItalic(inputAttrs, !StyleConstants.isItalic(inputAttrs));
+            // No selection — toggle sticky typing mode
+            MutableAttributeSet inputAttrs = textPane.getInputAttributes();
+            if (toggleBold) {
+                typingBold = !typingBold;
+                StyleConstants.setBold(inputAttrs, typingBold);
+            }
+            if (toggleItalic) {
+                typingItalic = !typingItalic;
+                StyleConstants.setItalic(inputAttrs, typingItalic);
+            }
         }
-
         if (onFormattingChange != null) onFormattingChange.run();
     }
 
-    /** Reflects bold state: input-attribute mode when no selection, or char-at-caret otherwise. */
     public boolean isBoldAtCaret() {
-        return StyleConstants.isBold(textPane.getInputAttributes());
+        // When text is selected, reflect the document's character attributes.
+        // When no selection, return our tracked typing mode (immune to Swing's resets).
+        if (textPane.getSelectionStart() != textPane.getSelectionEnd()) {
+            return StyleConstants.isBold(textPane.getInputAttributes());
+        }
+        return typingBold;
     }
 
-    /** Reflects italic state: input-attribute mode when no selection, or char-at-caret otherwise. */
     public boolean isItalicAtCaret() {
-        return StyleConstants.isItalic(textPane.getInputAttributes());
+        if (textPane.getSelectionStart() != textPane.getSelectionEnd()) {
+            return StyleConstants.isItalic(textPane.getInputAttributes());
+        }
+        return typingItalic;
     }
 
-    /** Registers a callback fired on every caret move so the toolbar can sync button states. */
-    public void setOnFormattingChange(Runnable r) {
-        this.onFormattingChange = r;
+    public void setOnFormattingChange(Runnable r) { this.onFormattingChange = r; }
+
+    // ─── BlockCRDT Bridge ────────────────────────────────────────────────────
+
+    /** Wraps the current CharacterCRDT in a single-block BlockCRDT for saving/exporting. */
+    public BlockCRDT getAsBlockCRDT() {
+        BlockCRDT blockCRDT = new BlockCRDT();
+        Block block = new Block(new BlockID(1, localUserID));
+        block.getContent().bulkLoad(crdt.getAllChars());
+        blockCRDT.insertBlock(block);
+        return blockCRDT;
     }
 
-    // ─── Import / Export ─────────────────────────────────────────────────────
+    /** Replaces the editor's content with the first visible block(s) from a loaded BlockCRDT. */
+    public void loadFromBlockCRDT(BlockCRDT blockCRDT) {
+        // clear() reuses the same CharacterCRDT instance so WebSocketClient's reference stays valid
+        crdt.clear();
+        cursorTracker.clear();
+        caretCharId   = null;
+        savedSelStart = 0;
+        savedSelEnd   = 0;
+        typingBold    = false;
+        typingItalic  = false;
 
-    public String getPlainText() {
-        // Use the visible textPane content as the authoritative source for export —
-        // avoids any CRDT sync edge cases and exports exactly what the user sees.
-        return textPane.getText();
+        for (Block block : blockCRDT.getVisibleBlocks()) {
+            crdt.bulkLoad(block.getContent().getAllChars());
+        }
+        refreshDisplay();
     }
 
-    public void clearDocument() {
-        loadPlainText("");
-    }
+    // ─── Plain Text Helpers ───────────────────────────────────────────────────
+
+    public String getPlainText() { return textPane.getText(); }
+
+    public void clearDocument() { loadPlainText(""); }
 
     public void loadPlainText(String text) {
         crdt = new CharacterCRDT();
         clock = new Clock();
         cursorTracker.clear();
-        caretCharId = null;
+        caretCharId  = null;
+        typingBold   = false;
+        typingItalic = false;
 
         for (int i = 0; i < text.length(); i++) {
-            int t = clock.tick();
-            CharId id = new CharId(t, localUserID);
+            int    t        = clock.tick();
+            CharId id       = new CharId(t, localUserID);
             CharId parentID = (i == 0) ? null : new CharId(t - 1, localUserID);
             crdt.insert(id, text.charAt(i), parentID);
         }
@@ -417,31 +477,15 @@ public class EditorPane extends JPanel {
 
     // ─── Integration Points ───────────────────────────────────────────────────
 
-    public void setNetworkSender(NetworkSender sender) {
-        this.networkSender = sender;
-    }
+    public void setNetworkSender(NetworkSender sender) { this.networkSender = sender; }
 
-    /** Exposes the CRDT so EditorWindow can share it with WebSocketClient. */
-    public CharacterCRDT getCRDT() {
-        return crdt;
-    }
+    public void setUndoRedoManager(UndoRedoManager mgr) { this.undoRedoManager = mgr; }
 
-    /** Exposes the Clock so EditorWindow can share it with WebSocketClient. */
-    public Clock getClock() {
-        return clock;
-    }
+    public CharacterCRDT getCRDT()  { return crdt;  }
+    public Clock         getClock() { return clock; }
 
-    /** Updates session state without triggering a network connection. */
-    public void setSessionInfo(String sid, int uid) {
-        this.sessionID = sid;
-        this.localUserID = uid;
-    }
+    public void setSessionInfo(String sid, int uid) { this.sessionID = sid; this.localUserID = uid; }
 
-    /**
-     * Receives remote cursor positions as CharIds (from WebSocketClient snapshot),
-     * converts them to integer offsets using the local CRDT, and re-renders cursors.
-     * Called from EditorWindow's refresh callback on the EDT.
-     */
     public void updateRemoteCursorsFromCharIds(Map<Integer, CharId> charIdCursors) {
         cursorTracker.clear();
         List<CRDTChar> visible = crdt.getVisibleChars();
@@ -454,15 +498,10 @@ public class EditorPane extends JPanel {
                 for (int i = 0; i < visible.size(); i++) {
                     if (visible.get(i).id.equals(cid)) {
                         cursorTracker.update(entry.getKey(), i + 1);
-                        found = true;
-                        break;
+                        found = true; break;
                     }
                 }
-                if (!found) {
-                    // If the referenced char is not visible yet (or got tombstoned),
-                    // place cursor at end to avoid a stale one-char lag.
-                    cursorTracker.update(entry.getKey(), visible.size());
-                }
+                if (!found) cursorTracker.update(entry.getKey(), visible.size());
             }
         }
         renderRemoteCursors();
@@ -471,7 +510,6 @@ public class EditorPane extends JPanel {
     // ─── Envelope Builders ───────────────────────────────────────────────────
 
     private String buildOperationEnvelope(Operation op) {
-        // OperationSerializer.serialize() returns a JSON object — embed directly as the "data" value
         String opJson = OperationSerializer.serialize(op);
         return "{\"action\":\"operation\""
             + ",\"sessionID\":\"" + sessionID + "\""
@@ -481,7 +519,6 @@ public class EditorPane extends JPanel {
     }
 
     private String buildCursorEnvelope() {
-        // Encode cursor as CharId (afterUserID/afterClock) — WebSocketClient.sendCursorPosition() expects this format
         int afterUserID = (caretCharId == null) ? -1 : caretCharId.userID;
         int afterClock  = (caretCharId == null) ? -1 : caretCharId.counter;
         return "{\"action\":\"cursor\""

@@ -109,9 +109,6 @@ public class MessageHandler {
 
             // Apply operation to local CRDT
             op.apply(crdt);
-
-            System.out.println("[MessageHandler] Applied remote operation: " + operationJson);
-
             triggerRefresh();
 
         } catch (Exception e) {
@@ -216,7 +213,6 @@ public class MessageHandler {
                 }
             }
 
-            System.out.println("[MessageHandler] Updated user list: " + activeUsers);
             triggerRefresh();
 
         } catch (Exception e) {
@@ -267,7 +263,6 @@ public class MessageHandler {
                 remoteCursors.put(senderUserID, position);
             }
 
-            System.out.println("[MessageHandler] Updated cursor for user " + senderUserID + ": " + position);
             triggerRefresh();
 
         } catch (Exception e) {

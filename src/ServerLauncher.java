@@ -9,10 +9,10 @@ public class ServerLauncher {
     public static void main(String[] args) {
         int port = 8081;
         
-        System.out.println("╔════════════════════════════════════════════════════════╗");
-        System.out.println("║   Collaborative Text Editor - WebSocket Server         ║");
-        System.out.println("║   Starting server on ws://localhost:" + port + "                  ║");
-        System.out.println("╚════════════════════════════════════════════════════════╝\n");
+        System.out.println("========================================================");
+        System.out.println("   Collaborative Text Editor - WebSocket Server");
+        System.out.println("   Starting server on ws://localhost:" + port);
+        System.out.println("========================================================\n");
         
         try {
             WebSocketServer server = new WebSocketServer(port);

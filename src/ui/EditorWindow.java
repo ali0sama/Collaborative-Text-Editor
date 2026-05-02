@@ -2,20 +2,30 @@ package ui;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import crdt.block.BlockCRDT;
 import crdt.character.CharId;
+import database.DatabaseManager;
+import database.FileRepository;
+import filemanagement.FileManager;
+import filemanagement.PermissionDeniedException;
+import filemanagement.PermissionManager;
+import filemanagement.ShareCodeManager;
+import io.ImportExportManager;
 import network.WebSocketClient;
 import operations.Operation;
 import serializations.OperationSerializer;
 import session.CollaborationSession;
 import session.CollaborationSession.UserRole;
+import undoredo.UndoRedoManager;
 
 import javax.swing.*;
-import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.*;
 import java.awt.event.*;
-import java.io.*;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.sql.SQLException;
+import java.util.List;
+import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
 
@@ -23,23 +33,32 @@ public class EditorWindow extends JFrame {
 
     // ─── Document State ───────────────────────────────────────────────────────
 
-    private String currentDocId   = null;
-    private String currentDocName = "Untitled";
-    private UserRole currentRole;
+    private String currentDocId      = null;
+    private String currentDocName    = "Untitled";
+    private String currentEditorCode = null;
+    private String currentViewerCode = null;
+    private UserRole currentRole;                       // for network / display
+    private PermissionManager.UserRole permRole;        // for file-op permission checks
+
+    // ─── Backend ─────────────────────────────────────────────────────────────
+
+    private final int             localUserID;
+    private final DatabaseManager dbManager;
+    private final FileRepository  fileRepository;
+    private final FileManager     fileManager;
+    private       UndoRedoManager undoRedoManager;
 
     // ─── UI Components ────────────────────────────────────────────────────────
 
     private final EditorPane editorPane;
     private final UserPanel  userPanel;
 
-    // Toolbar buttons
     private final JToggleButton boldBtn;
     private final JToggleButton italicBtn;
-    private final JButton undoBtn;
-    private final JButton redoBtn;
-    private final JButton shareBtn;
+    private final JButton       undoBtn;
+    private final JButton       redoBtn;
+    private final JButton       shareBtn;
 
-    // Status bar
     private final JLabel statusLabel;
     private final JLabel roleLabel;
     private final JLabel docNameLabel;
@@ -56,10 +75,32 @@ public class EditorWindow extends JFrame {
     // ─── Constructor ─────────────────────────────────────────────────────────
 
     public EditorWindow(int userID, String sessionID, CollaborationSession session, boolean isEditor) {
-        currentRole = isEditor ? UserRole.EDITOR : UserRole.VIEWER;
+        this.localUserID = userID;
+        this.currentRole = isEditor ? UserRole.EDITOR : UserRole.VIEWER;
+        this.permRole    = isEditor ? PermissionManager.UserRole.EDITOR : PermissionManager.UserRole.VIEWER;
 
+        // --- Backend initialization
+        DatabaseManager dm = null;
+        FileRepository  fr = null;
+        try {
+            dm = new DatabaseManager();
+            dm.connect();
+            fr = new FileRepository(dm);
+        } catch (SQLException e) {
+            JOptionPane.showMessageDialog(null,
+                "Database initialization failed: " + e.getMessage(),
+                "Startup Error", JOptionPane.ERROR_MESSAGE);
+        }
+        this.dbManager      = dm;
+        this.fileRepository = fr;
+        this.fileManager    = (fr != null) ? new FileManager(fr) : null;
+
+        // --- EditorPane (must come before UndoRedoManager so we can pass its Clock)
         editorPane = new EditorPane(userID, sessionID, isEditor);
         userPanel  = new UserPanel(session);
+
+        this.undoRedoManager = new UndoRedoManager(userID, editorPane.getClock());
+        editorPane.setUndoRedoManager(undoRedoManager);
 
         // --- Menu bar
         setJMenuBar(buildMenuBar());
@@ -178,19 +219,23 @@ public class EditorWindow extends JFrame {
 
         JMenuItem newItem    = new JMenuItem("New File");
         JMenuItem openItem   = new JMenuItem("Open File");
+        JMenuItem saveItem   = new JMenuItem("Save");
         JMenuItem renameItem = new JMenuItem("Rename File");
         JMenuItem deleteItem = new JMenuItem("Delete File");
 
         newItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_N, InputEvent.CTRL_DOWN_MASK));
         openItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_O, InputEvent.CTRL_DOWN_MASK));
+        saveItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_S, InputEvent.CTRL_DOWN_MASK));
 
         newItem.addActionListener(e    -> handleNewFile());
         openItem.addActionListener(e   -> handleOpenFile());
+        saveItem.addActionListener(e   -> triggerSave());
         renameItem.addActionListener(e -> handleRenameFile());
         deleteItem.addActionListener(e -> handleDeleteFile());
 
         fileMenu.add(newItem);
         fileMenu.add(openItem);
+        fileMenu.add(saveItem);
         fileMenu.add(renameItem);
         fileMenu.add(deleteItem);
         fileMenu.addSeparator();
@@ -216,6 +261,7 @@ public class EditorWindow extends JFrame {
 
         im.put(KeyStroke.getKeyStroke(KeyEvent.VK_Z, InputEvent.CTRL_DOWN_MASK), "undo");
         im.put(KeyStroke.getKeyStroke(KeyEvent.VK_Y, InputEvent.CTRL_DOWN_MASK), "redo");
+        im.put(KeyStroke.getKeyStroke(KeyEvent.VK_S, InputEvent.CTRL_DOWN_MASK), "save");
 
         am.put("undo", new AbstractAction() {
             @Override public void actionPerformed(ActionEvent e) { handleUndo(); }
@@ -223,116 +269,179 @@ public class EditorWindow extends JFrame {
         am.put("redo", new AbstractAction() {
             @Override public void actionPerformed(ActionEvent e) { handleRedo(); }
         });
+        am.put("save", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { triggerSave(); }
+        });
     }
 
     // ─── File Menu Handlers ───────────────────────────────────────────────────
 
     private void handleNewFile() {
+        if (fileManager == null) { showBackendUnavailable(); return; }
         String name = JOptionPane.showInputDialog(this, "Enter file name:", "New File", JOptionPane.PLAIN_MESSAGE);
         if (name == null || name.trim().isEmpty()) return;
 
-        // TODO: wire to FileManager.createNewFile(name) once Member 2 delivers it
-        // currentDocId = fileManager.createNewFile(name.trim());
-        currentDocName = name.trim();
-        editorPane.clearDocument();
-        updateTitle();
-        showSaved("New file created");
+        try {
+            String docId = fileManager.createNewFile(name.trim());
+            currentDocId   = docId;
+            currentDocName = name.trim();
+            permRole       = PermissionManager.UserRole.EDITOR;
+
+            // Retrieve the codes generated internally by createNewFile
+            for (String[] rec : fileRepository.getAllFileRecords()) {
+                if (rec[0].equals(docId)) {
+                    currentEditorCode = rec[2];
+                    currentViewerCode = rec[3];
+                    break;
+                }
+            }
+
+            editorPane.clearDocument();
+            resetUndoRedo();
+            updateTitle();
+            showSaved("New file created");
+        } catch (SQLException e) {
+            JOptionPane.showMessageDialog(this,
+                "Could not create file: " + e.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+        }
     }
 
     private void handleOpenFile() {
-        // TODO: wire to FileManager.listAllFiles() + loadFile() once Member 2 delivers it
-        JOptionPane.showMessageDialog(this,
-            "Open File requires FileManager (Member 2).\nWill be connected when available.",
-            "Coming Soon", JOptionPane.INFORMATION_MESSAGE);
+        if (fileManager == null) { showBackendUnavailable(); return; }
+        try {
+            List<String[]> records = fileRepository.getAllFileRecords();
+            if (records.isEmpty()) {
+                JOptionPane.showMessageDialog(this,
+                    "No saved files found.", "Open File", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+
+            String[] displayNames = new String[records.size()];
+            for (int i = 0; i < records.size(); i++) {
+                String[] r = records.get(i);
+                displayNames[i] = r[1] + "  [" + r[0].substring(0, 8) + "...]";
+            }
+
+            String chosen = (String) JOptionPane.showInputDialog(
+                this, "Select a file to open:", "Open File",
+                JOptionPane.PLAIN_MESSAGE, null, displayNames, displayNames[0]);
+            if (chosen == null) return;
+
+            int idx = -1;
+            for (int i = 0; i < displayNames.length; i++) {
+                if (displayNames[i].equals(chosen)) { idx = i; break; }
+            }
+            if (idx < 0) return;
+
+            String[] rec    = records.get(idx);
+            BlockCRDT loaded = fileManager.openFile(rec[0]);
+            if (loaded == null) {
+                JOptionPane.showMessageDialog(this,
+                    "File content could not be loaded.", "Open File", JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+
+            currentDocId      = rec[0];
+            currentDocName    = rec[1];
+            currentEditorCode = rec[2];
+            currentViewerCode = rec[3];
+            permRole          = PermissionManager.UserRole.EDITOR;
+
+            editorPane.loadFromBlockCRDT(loaded);
+            resetUndoRedo();
+            updateTitle();
+            showSaved("Opened");
+        } catch (SQLException e) {
+            JOptionPane.showMessageDialog(this,
+                "Could not open file: " + e.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+        }
     }
 
     private void handleRenameFile() {
         if (currentDocId == null) {
-            JOptionPane.showMessageDialog(this, "No file is currently open.", "Rename File", JOptionPane.WARNING_MESSAGE);
+            JOptionPane.showMessageDialog(this,
+                "No file is currently open.", "Rename File", JOptionPane.WARNING_MESSAGE);
             return;
         }
+        try {
+            PermissionManager.enforce(permRole, "RENAME");
+        } catch (PermissionDeniedException ex) {
+            JOptionPane.showMessageDialog(this, ex.getMessage(), "Permission Denied", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
         String newName = JOptionPane.showInputDialog(this, "Enter new name:", currentDocName);
         if (newName == null || newName.trim().isEmpty()) return;
 
-        // TODO: wire to FileManager.renameFile(currentDocId, newName) once Member 2 delivers it
-        currentDocName = newName.trim();
-        updateTitle();
-        showSaved("Renamed");
+        try {
+            fileManager.renameFile(currentDocId, newName.trim());
+            currentDocName = newName.trim();
+            updateTitle();
+            showSaved("Renamed");
+        } catch (SQLException e) {
+            JOptionPane.showMessageDialog(this,
+                "Could not rename file: " + e.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+        }
     }
 
     private void handleDeleteFile() {
         if (currentDocId == null) {
-            JOptionPane.showMessageDialog(this, "No file is currently open.", "Delete File", JOptionPane.WARNING_MESSAGE);
+            JOptionPane.showMessageDialog(this,
+                "No file is currently open.", "Delete File", JOptionPane.WARNING_MESSAGE);
             return;
         }
+        try {
+            PermissionManager.enforce(permRole, "DELETE");
+        } catch (PermissionDeniedException ex) {
+            JOptionPane.showMessageDialog(this, ex.getMessage(), "Permission Denied", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
         int choice = JOptionPane.showConfirmDialog(this,
             "Delete \"" + currentDocName + "\"? This cannot be undone.",
             "Delete File", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
         if (choice != JOptionPane.YES_OPTION) return;
 
-        // TODO: wire to FileManager.deleteFile(currentDocId) once Member 2 delivers it
-        currentDocId   = null;
-        currentDocName = "Untitled";
-        editorPane.clearDocument();
-        updateTitle();
+        try {
+            fileManager.deleteFile(currentDocId);
+            currentDocId      = null;
+            currentDocName    = "Untitled";
+            currentEditorCode = null;
+            currentViewerCode = null;
+            editorPane.clearDocument();
+            resetUndoRedo();
+            updateTitle();
+        } catch (SQLException e) {
+            JOptionPane.showMessageDialog(this,
+                "Could not delete file: " + e.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+        }
     }
 
     // ─── Import / Export ──────────────────────────────────────────────────────
 
     private void handleImport() {
-        JFileChooser chooser = new JFileChooser();
-        chooser.setFileFilter(new FileNameExtensionFilter("Text files (*.txt)", "txt"));
-        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
-
-        // TODO: replace with ImportExportManager.importFromTxt() once Member 3 delivers it,
-        //       which will also parse *bold* and _italic_ markers into the CRDT.
-        try (BufferedReader reader = new BufferedReader(new FileReader(chooser.getSelectedFile()))) {
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) sb.append(line).append("\n");
-            editorPane.loadPlainText(sb.toString());
-        } catch (IOException ex) {
-            JOptionPane.showMessageDialog(this,
-                "Failed to read file: " + ex.getMessage(), "Import Error", JOptionPane.ERROR_MESSAGE);
-        }
-        SwingUtilities.invokeLater(editorPane::repaint);
+        BlockCRDT imported = ImportExportManager.importWithChooser(localUserID, editorPane.getClock(), this);
+        if (imported == null) return;
+        editorPane.loadFromBlockCRDT(imported);
+        resetUndoRedo();
     }
 
     private void handleExport() {
-        JFileChooser chooser = new JFileChooser();
-        chooser.setFileFilter(new FileNameExtensionFilter("Text files (*.txt)", "txt"));
-        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
-
-        File file = chooser.getSelectedFile();
-        if (!file.getName().endsWith(".txt")) file = new File(file.getPath() + ".txt");
-
-        // TODO: replace with ImportExportManager.exportToTxt() once Member 3 delivers it,
-        //       which will embed *bold* and _italic_ markers in the output.
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter(file))) {
-            writer.write(editorPane.getPlainText());
-        } catch (IOException ex) {
-            JOptionPane.showMessageDialog(this,
-                "Failed to write file: " + ex.getMessage(), "Export Error", JOptionPane.ERROR_MESSAGE);
-        }
-        SwingUtilities.invokeLater(editorPane::repaint);
+        ImportExportManager.exportWithChooser(editorPane.getAsBlockCRDT(), this);
     }
 
     // ─── Undo / Redo ──────────────────────────────────────────────────────────
 
     private void handleUndo() {
-        if (currentRole != UserRole.EDITOR) return;
-        // TODO: wire to UndoRedoManager.undo(crdt) once Member 3 delivers it
-        // undoRedoManager.undo(editorPane.getCRDT());
-        // editorPane.refreshDisplay();
-        System.out.println("[EditorWindow] Undo triggered — UndoRedoManager not yet connected");
+        if (currentRole != UserRole.EDITOR || !undoRedoManager.canUndo()) return;
+        undoRedoManager.undo(editorPane.getCRDT());
+        editorPane.refreshDisplay();
     }
 
     private void handleRedo() {
-        if (currentRole != UserRole.EDITOR) return;
-        // TODO: wire to UndoRedoManager.redo(crdt) once Member 3 delivers it
-        // undoRedoManager.redo(editorPane.getCRDT());
-        // editorPane.refreshDisplay();
-        System.out.println("[EditorWindow] Redo triggered — UndoRedoManager not yet connected");
+        if (currentRole != UserRole.EDITOR || !undoRedoManager.canRedo()) return;
+        undoRedoManager.redo(editorPane.getCRDT());
+        editorPane.refreshDisplay();
     }
 
     // ─── Share Dialog ─────────────────────────────────────────────────────────
@@ -344,11 +453,12 @@ public class EditorWindow extends JFrame {
                 "Share", JOptionPane.WARNING_MESSAGE);
             return;
         }
-
-        // TODO: replace placeholder strings with ShareCodeManager.getCodesForDocument(currentDocId, EDITOR)
-        //       once Member 2 delivers it.
-        String editorCode = "????????";
-        String viewerCode = "????????";
+        try {
+            PermissionManager.enforce(permRole, "VIEW_CODES");
+        } catch (PermissionDeniedException ex) {
+            JOptionPane.showMessageDialog(this, ex.getMessage(), "Permission Denied", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
 
         JDialog dialog = new JDialog(this, "Share Codes", true);
         dialog.setLayout(new GridBagLayout());
@@ -359,7 +469,8 @@ public class EditorWindow extends JFrame {
         gbc.gridx = 0; gbc.gridy = 0;
         dialog.add(new JLabel("Editor Code:"), gbc);
         gbc.gridx = 1;
-        JTextField editorField = new JTextField(editorCode, 12);
+        JTextField editorField = new JTextField(
+            currentEditorCode != null ? currentEditorCode : "N/A", 12);
         editorField.setEditable(false);
         editorField.setFont(new Font("Monospaced", Font.BOLD, 15));
         dialog.add(editorField, gbc);
@@ -367,7 +478,8 @@ public class EditorWindow extends JFrame {
         gbc.gridx = 0; gbc.gridy = 1;
         dialog.add(new JLabel("Viewer Code:"), gbc);
         gbc.gridx = 1;
-        JTextField viewerField = new JTextField(viewerCode, 12);
+        JTextField viewerField = new JTextField(
+            currentViewerCode != null ? currentViewerCode : "N/A", 12);
         viewerField.setEditable(false);
         viewerField.setFont(new Font("Monospaced", Font.BOLD, 15));
         dialog.add(viewerField, gbc);
@@ -410,16 +522,48 @@ public class EditorWindow extends JFrame {
             }
             dialog.dispose();
 
-            // TODO: replace with ShareCodeManager.joinByCode(code) once Member 2 delivers it.
-            //       That call returns a docId and a UserRole, then:
-            //         currentDocId = result.docId;
-            //         currentRole  = result.role;
-            //         applyRoleMode(currentRole == UserRole.EDITOR);
-            //         BlockCRDT crdt = fileManager.openFile(currentDocId);
-            //         editorPane.loadFromCRDT(crdt);
-            JOptionPane.showMessageDialog(this,
-                "Join by code requires ShareCodeManager (Member 2).\nCode entered: " + code,
-                "Coming Soon", JOptionPane.INFORMATION_MESSAGE);
+            if (fileRepository == null) { showBackendUnavailable(); return; }
+            try {
+                Map<String, Object> result = ShareCodeManager.joinByCode(fileRepository, code);
+                if (result == null) {
+                    JOptionPane.showMessageDialog(this,
+                        "No document found for that code.", "Not Found", JOptionPane.WARNING_MESSAGE);
+                    return;
+                }
+
+                String                     docId    = (String) result.get("docId");
+                PermissionManager.UserRole joinRole = (PermissionManager.UserRole) result.get("role");
+                boolean                    canEdit  = PermissionManager.canEdit(joinRole);
+
+                BlockCRDT loaded = fileManager.openFile(docId);
+                if (loaded == null) {
+                    JOptionPane.showMessageDialog(this,
+                        "File content could not be loaded.", "Error", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+
+                // Fetch full metadata for the joined document
+                for (String[] rec : fileRepository.getAllFileRecords()) {
+                    if (rec[0].equals(docId)) {
+                        currentDocName    = rec[1];
+                        currentEditorCode = rec[2];
+                        currentViewerCode = rec[3];
+                        break;
+                    }
+                }
+                currentDocId = docId;
+                permRole     = joinRole;
+                currentRole  = canEdit ? UserRole.EDITOR : UserRole.VIEWER;
+
+                editorPane.loadFromBlockCRDT(loaded);
+                resetUndoRedo();
+                applyRoleMode(canEdit);
+                updateTitle();
+                showSaved("Joined");
+            } catch (SQLException ex) {
+                JOptionPane.showMessageDialog(this,
+                    "Could not join: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+            }
         });
 
         gbc.gridx = 0; gbc.gridy = 2; gbc.anchor = GridBagConstraints.CENTER;
@@ -498,12 +642,18 @@ public class EditorWindow extends JFrame {
         }, 30_000, 30_000);
     }
 
-    /** Called after every insert/delete/format and by the 30-second timer. */
     public void triggerSave() {
-        if (currentDocId == null) return;
-        // TODO: call FileRepository.saveFile(currentDocId, currentDocName, editorCode, viewerCode, blockCRDT)
-        //       once Member 1 delivers FileRepository.
-        showSaved("Saved");
+        if (currentDocId == null || fileRepository == null) return;
+        if (currentEditorCode == null || currentViewerCode == null) return;
+        try {
+            fileRepository.saveFile(
+                currentDocId, currentDocName,
+                currentEditorCode, currentViewerCode,
+                editorPane.getAsBlockCRDT());
+            showSaved("Saved");
+        } catch (SQLException e) {
+            System.err.println("[EditorWindow] Auto-save failed: " + e.getMessage());
+        }
     }
 
     private void showSaved(String message) {
@@ -523,7 +673,7 @@ public class EditorWindow extends JFrame {
         italicBtn.setEnabled(canEdit);
         undoBtn.setEnabled(canEdit);
         redoBtn.setEnabled(canEdit);
-        shareBtn.setVisible(canEdit);   // viewers never see the Share button
+        shareBtn.setVisible(canEdit);
 
         roleLabel.setText(canEdit ? "Editor" : "Viewer");
         roleLabel.setForeground(canEdit ? new Color(0, 100, 0) : new Color(110, 110, 110));
@@ -538,6 +688,19 @@ public class EditorWindow extends JFrame {
 
     private static JLabel makeSep() {
         return new JLabel(" | ");
+    }
+
+    private void showBackendUnavailable() {
+        JOptionPane.showMessageDialog(this,
+            "Database is not available. Check startup logs.",
+            "Backend Error", JOptionPane.ERROR_MESSAGE);
+    }
+
+    /** Recreates UndoRedoManager after loading a new document so the Clock reference stays valid. */
+    private void resetUndoRedo() {
+        undoRedoManager = new UndoRedoManager(localUserID, editorPane.getClock());
+        editorPane.setUndoRedoManager(undoRedoManager);
+        if (wsClient != null) undoRedoManager.setWebSocketClient(wsClient);
     }
 
     // ─── Server Connection ────────────────────────────────────────────────────
@@ -581,6 +744,9 @@ public class EditorWindow extends JFrame {
                 onRemoteUpdate
             );
             editorPane.setNetworkSender(new NetworkSenderAdapter(wsClient));
+            undoRedoManager.setWebSocketClient(wsClient);
+            wsClient.setDisconnectCallback(() ->
+                SwingUtilities.invokeLater(() -> setStatus("Disconnected — reconnecting…")));
             wsClient.connectToServer();
         } catch (URISyntaxException e) {
             JOptionPane.showMessageDialog(this, "Invalid server URL.", "Error", JOptionPane.ERROR_MESSAGE);
@@ -591,7 +757,12 @@ public class EditorWindow extends JFrame {
 
     public void setStatus(String status) {
         statusLabel.setText(status);
-        statusLabel.setForeground("Connected".equals(status) ? new Color(0, 140, 0) : Color.GRAY);
+        if ("Connected".equals(status))
+            statusLabel.setForeground(new Color(0, 140, 0));
+        else if (status.startsWith("Disconnected"))
+            statusLabel.setForeground(new Color(180, 0, 0));
+        else
+            statusLabel.setForeground(Color.GRAY);
     }
 
     public void updateSession(CollaborationSession newSession) {

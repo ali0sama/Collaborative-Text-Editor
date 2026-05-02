@@ -23,10 +23,17 @@ sourceSets {
 task runUI(type: JavaExec) {
     classpath = sourceSets.main.runtimeClasspath
     mainClass = 'ui.EditorWindow'
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
 }
 
 // Run the Phase 1 + Phase 2 test suite
 task runTests(type: JavaExec) {
     classpath = sourceSets.main.runtimeClasspath
     mainClass = 'Main'
+}
+
+// Launch the WebSocket collaboration server
+task runServer(type: JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'ServerLauncher'
 }
