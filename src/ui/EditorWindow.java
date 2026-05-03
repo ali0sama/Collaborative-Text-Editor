@@ -503,70 +503,68 @@ public class EditorWindow extends JFrame {
         gbc.insets = new Insets(8, 12, 8, 12);
         gbc.anchor = GridBagConstraints.WEST;
 
-        gbc.gridx = 0; gbc.gridy = 0;
-        dialog.add(new JLabel("Enter 8-character share code:"), gbc);
-
-        gbc.gridx = 0; gbc.gridy = 1;
-        JTextField codeField = new JTextField(12);
+        JTextField   serverField  = new JTextField("ws://127.0.0.1:8081", 20);
+        JTextField   codeField    = new JTextField(12);
         codeField.setFont(new Font("Monospaced", Font.BOLD, 15));
-        dialog.add(codeField, gbc);
+        JTextField   userIdField  = new JTextField(String.valueOf(localUserID), 8);
+        JRadioButton editorRadio  = new JRadioButton("Editor", true);
+        JRadioButton viewerRadio  = new JRadioButton("Viewer");
+        ButtonGroup  roleGroup    = new ButtonGroup();
+        roleGroup.add(editorRadio);
+        roleGroup.add(viewerRadio);
+
+        gbc.gridx = 0; gbc.gridy = 0; dialog.add(new JLabel("Server URL:"), gbc);
+        gbc.gridx = 1;               dialog.add(serverField, gbc);
+        gbc.gridx = 0; gbc.gridy = 1; dialog.add(new JLabel("Share Code:"), gbc);
+        gbc.gridx = 1;               dialog.add(codeField, gbc);
+        gbc.gridx = 0; gbc.gridy = 2; dialog.add(new JLabel("User ID:"), gbc);
+        gbc.gridx = 1;               dialog.add(userIdField, gbc);
+        gbc.gridx = 0; gbc.gridy = 3; dialog.add(new JLabel("Role:"), gbc);
+        JPanel rolePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        rolePanel.add(editorRadio);
+        rolePanel.add(viewerRadio);
+        gbc.gridx = 1; dialog.add(rolePanel, gbc);
 
         JButton joinBtn = new JButton("Join");
         joinBtn.addActionListener(e -> {
-            String code = codeField.getText().trim().toUpperCase();
+            String code      = codeField.getText().trim().toUpperCase();
+            String serverUrl = serverField.getText().trim();
+            String uidStr    = userIdField.getText().trim();
+
             if (code.length() != 8 || !code.matches("[A-Z0-9]+")) {
                 JOptionPane.showMessageDialog(dialog,
                     "Code must be exactly 8 alphanumeric characters (A-Z, 0-9).",
                     "Invalid Code", JOptionPane.ERROR_MESSAGE);
                 return;
             }
+            if (serverUrl.isEmpty() || uidStr.isEmpty()) {
+                JOptionPane.showMessageDialog(dialog, "Please fill in all fields.");
+                return;
+            }
+            int uid;
+            try {
+                uid = Integer.parseInt(uidStr);
+            } catch (NumberFormatException ex) {
+                JOptionPane.showMessageDialog(dialog, "User ID must be a number.");
+                return;
+            }
+
+            String role = editorRadio.isSelected() ? "editor" : "viewer";
             dialog.dispose();
 
-            if (fileRepository == null) { showBackendUnavailable(); return; }
-            try {
-                Map<String, Object> result = ShareCodeManager.joinByCode(fileRepository, code);
-                if (result == null) {
-                    JOptionPane.showMessageDialog(this,
-                        "No document found for that code.", "Not Found", JOptionPane.WARNING_MESSAGE);
-                    return;
-                }
-
-                String                     docId    = (String) result.get("docId");
-                PermissionManager.UserRole joinRole = (PermissionManager.UserRole) result.get("role");
-                boolean                    canEdit  = PermissionManager.canEdit(joinRole);
-
-                BlockCRDT loaded = fileManager.openFile(docId);
-                if (loaded == null) {
-                    JOptionPane.showMessageDialog(this,
-                        "File content could not be loaded.", "Error", JOptionPane.ERROR_MESSAGE);
-                    return;
-                }
-
-                // Fetch full metadata for the joined document
-                for (String[] rec : fileRepository.getAllFileRecords()) {
-                    if (rec[0].equals(docId)) {
-                        currentDocName    = rec[1];
-                        currentEditorCode = rec[2];
-                        currentViewerCode = rec[3];
-                        break;
-                    }
-                }
-                currentDocId = docId;
-                permRole     = joinRole;
-                currentRole  = canEdit ? UserRole.EDITOR : UserRole.VIEWER;
-
-                editorPane.loadFromBlockCRDT(loaded);
-                resetUndoRedo();
-                applyRoleMode(canEdit);
-                updateTitle();
-                showSaved("Joined");
-            } catch (SQLException ex) {
-                JOptionPane.showMessageDialog(this,
-                    "Could not join: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
-            }
+            // Connect directly to the server using the share code as the session ID.
+            // The document owner must have connected with this same code as their session ID.
+            // The server will replay its operation history so this client reconstructs the document.
+            editorPane.clearDocument();
+            resetUndoRedo();
+            currentDocName    = "Shared Document";
+            currentEditorCode = code;
+            currentDocId      = null;
+            updateTitle();
+            connectToServer(serverUrl, code, uid, role);
         });
 
-        gbc.gridx = 0; gbc.gridy = 2; gbc.anchor = GridBagConstraints.CENTER;
+        gbc.gridx = 0; gbc.gridy = 4; gbc.gridwidth = 2; gbc.anchor = GridBagConstraints.CENTER;
         dialog.add(joinBtn, gbc);
 
         dialog.pack();
@@ -584,7 +582,7 @@ public class EditorWindow extends JFrame {
         gbc.anchor = GridBagConstraints.WEST;
 
         JTextField   serverField  = new JTextField("ws://127.0.0.1:8081", 20);
-        JTextField   sessionField = new JTextField(16);
+        JTextField   sessionField = new JTextField(currentEditorCode != null ? currentEditorCode : "", 16);
         JTextField   userIdField  = new JTextField(16);
         JRadioButton editorRadio  = new JRadioButton("Editor", true);
         JRadioButton viewerRadio  = new JRadioButton("Viewer");
