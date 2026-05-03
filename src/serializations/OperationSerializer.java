@@ -4,6 +4,7 @@ import operations.*;
 import crdt.character.CharId;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import operations.FormatOperation;
 
 /**
  * Converts Operation objects to/from JSON strings for network transmission.
@@ -22,6 +23,8 @@ public class OperationSerializer {
             return serializeInsert((InsertOperation) op);
         } else if (op.getType() == Operation.Type.DELETE) {
             return serializeDelete((DeleteOperation) op);
+        } else if (op.getType() == Operation.Type.FORMAT) {
+            return serializeFormat((FormatOperation) op);
         }
         throw new IllegalArgumentException("Unknown operation type: " + op.getType());
     }
@@ -51,6 +54,20 @@ public class OperationSerializer {
         json.append("\"bold\": ").append(op.bold).append(", ");
         json.append("\"italic\": ").append(op.italic);
         
+        json.append("}");
+        return json.toString();
+    }
+
+    private static String serializeFormat(FormatOperation op) {
+        StringBuilder json = new StringBuilder();
+        json.append("{");
+        json.append("\"op\": \"format\", ");
+        json.append("\"userID\": ").append(op.userID).append(", ");
+        json.append("\"clock\": ").append(op.clock).append(", ");
+        json.append("\"targetUserID\": ").append(op.targetID.userID).append(", ");
+        json.append("\"targetClock\": ").append(op.targetID.counter).append(", ");
+        json.append("\"bold\": ").append(op.bold).append(", ");
+        json.append("\"italic\": ").append(op.italic);
         json.append("}");
         return json.toString();
     }
@@ -85,6 +102,8 @@ public class OperationSerializer {
             return deserializeInsert(obj);
         } else if ("delete".equals(opType)) {
             return deserializeDelete(obj);
+        } else if ("format".equals(opType)) {
+            return deserializeFormat(obj);
         }
         throw new IllegalArgumentException("Unknown operation type in JSON: " + opType);
     }
@@ -114,6 +133,16 @@ public class OperationSerializer {
         boolean italic = obj.has("italic") && obj.get("italic").getAsBoolean();
         
         return new InsertOperation(userID, clock, charValue, parentID, bold, italic);
+    }
+
+    private static FormatOperation deserializeFormat(JsonObject obj) {
+        int userID       = obj.get("userID").getAsInt();
+        int clock        = obj.get("clock").getAsInt();
+        int targetUserID = obj.get("targetUserID").getAsInt();
+        int targetClock  = obj.get("targetClock").getAsInt();
+        boolean bold     = obj.has("bold")   && obj.get("bold").getAsBoolean();
+        boolean italic   = obj.has("italic") && obj.get("italic").getAsBoolean();
+        return new FormatOperation(userID, clock, new CharId(targetClock, targetUserID), bold, italic);
     }
 
     /**

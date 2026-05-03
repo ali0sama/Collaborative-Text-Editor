@@ -18,6 +18,7 @@ import javax.swing.*;
 import javax.swing.event.*;
 import javax.swing.text.*;
 import operations.*;
+import operations.FormatOperation;
 import serializations.OperationSerializer;
 
 public class EditorPane extends JPanel {
@@ -250,9 +251,16 @@ public class EditorPane extends JPanel {
 
             if (chars.isEmpty()) { renderRemoteCursors(); return; }
 
+            // Set base font on the whole document before inserting text
+            SimpleAttributeSet baseAttrs = new SimpleAttributeSet();
+            StyleConstants.setFontFamily(baseAttrs, "Monospaced");
+            StyleConstants.setFontSize(baseAttrs, 14);
+            StyleConstants.setBold(baseAttrs, false);
+            StyleConstants.setItalic(baseAttrs, false);
+
             StringBuilder sb = new StringBuilder();
             for (CRDTChar c : chars) sb.append(c.value);
-            doc.insertString(0, sb.toString(), null);
+            doc.insertString(0, sb.toString(), baseAttrs);
 
             // Apply bold/italic in batched runs for efficiency
             int     groupStart  = 0;
@@ -265,15 +273,25 @@ public class EditorPane extends JPanel {
 
                 if (curBold != groupBold || curItalic != groupItalic) {
                     SimpleAttributeSet attrs = new SimpleAttributeSet();
+                    StyleConstants.setFontFamily(attrs, "Monospaced");
+                    StyleConstants.setFontSize(attrs, 14);
                     StyleConstants.setBold(attrs, groupBold);
                     StyleConstants.setItalic(attrs, groupItalic);
-                    doc.setCharacterAttributes(groupStart, i - groupStart, attrs, true);
+                    doc.setCharacterAttributes(groupStart, i - groupStart, attrs, false);
                     groupStart = i;
                     if (i < chars.size()) { groupBold = curBold; groupItalic = curItalic; }
                 }
             }
 
-            // Restore caret to the same logical CRDT position
+            // Flush the last run (always, to ensure the final segment has correct formatting)
+            SimpleAttributeSet lastAttrs = new SimpleAttributeSet();
+            StyleConstants.setFontFamily(lastAttrs, "Monospaced");
+            StyleConstants.setFontSize(lastAttrs, 14);
+            StyleConstants.setBold(lastAttrs, groupBold);
+            StyleConstants.setItalic(lastAttrs, groupItalic);
+            doc.setCharacterAttributes(groupStart, chars.size() - groupStart, lastAttrs, false);
+
+            // Restore caret via CRDT char id (accounts for remote inserts shifting offsets)
             int newPos = 0;
             if (caretCharId != null) {
                 for (int i = 0; i < chars.size(); i++) {
@@ -389,6 +407,15 @@ public class EditorPane extends JPanel {
             if (toggleItalic) {
                 boolean allItalic = selected.stream().allMatch(CRDTChar::isItalic);
                 for (CRDTChar c : selected) crdt.setItalic(c.id, !allItalic);
+            }
+
+            // Broadcast one FormatOperation per affected character so peers update their display
+            if (networkSender != null && networkSender.isConnected()) {
+                for (CRDTChar c : selected) {
+                    int t = clock.tick();
+                    FormatOperation op = new FormatOperation(localUserID, t, c.id, c.isBold(), c.isItalic());
+                    networkSender.sendMessage(buildOperationEnvelope(op));
+                }
             }
             refreshDisplay();
         } else {
