@@ -242,17 +242,6 @@ public class EditorPane extends JPanel {
     // ─── Display Refresh ─────────────────────────────────────────────────────
 
     public void refreshDisplay() {
-        // Before rebuilding, anchor caretCharId to the current visual position if not
-        // already set. This means remote inserts before our cursor will shift it correctly
-        // instead of leaving it at a stale offset.
-        if (caretCharId == null) {
-            int pos = textPane.getCaretPosition();
-            List<CRDTChar> pre = crdt.getVisibleChars();
-            if (pos > 0 && !pre.isEmpty()) {
-                caretCharId = pre.get(Math.min(pos - 1, pre.size() - 1)).id;
-            }
-        }
-
         suppressDocumentEvents = true;
         try {
             List<CRDTChar> chars = crdt.getVisibleChars();
@@ -262,9 +251,16 @@ public class EditorPane extends JPanel {
 
             if (chars.isEmpty()) { renderRemoteCursors(); return; }
 
+            // Set base font on the whole document before inserting text
+            SimpleAttributeSet baseAttrs = new SimpleAttributeSet();
+            StyleConstants.setFontFamily(baseAttrs, "Monospaced");
+            StyleConstants.setFontSize(baseAttrs, 14);
+            StyleConstants.setBold(baseAttrs, false);
+            StyleConstants.setItalic(baseAttrs, false);
+
             StringBuilder sb = new StringBuilder();
             for (CRDTChar c : chars) sb.append(c.value);
-            doc.insertString(0, sb.toString(), null);
+            doc.insertString(0, sb.toString(), baseAttrs);
 
             // Apply bold/italic in batched runs for efficiency
             int     groupStart  = 0;
@@ -277,13 +273,23 @@ public class EditorPane extends JPanel {
 
                 if (curBold != groupBold || curItalic != groupItalic) {
                     SimpleAttributeSet attrs = new SimpleAttributeSet();
+                    StyleConstants.setFontFamily(attrs, "Monospaced");
+                    StyleConstants.setFontSize(attrs, 14);
                     StyleConstants.setBold(attrs, groupBold);
                     StyleConstants.setItalic(attrs, groupItalic);
-                    doc.setCharacterAttributes(groupStart, i - groupStart, attrs, true);
+                    doc.setCharacterAttributes(groupStart, i - groupStart, attrs, false);
                     groupStart = i;
                     if (i < chars.size()) { groupBold = curBold; groupItalic = curItalic; }
                 }
             }
+
+            // Flush the last run (always, to ensure the final segment has correct formatting)
+            SimpleAttributeSet lastAttrs = new SimpleAttributeSet();
+            StyleConstants.setFontFamily(lastAttrs, "Monospaced");
+            StyleConstants.setFontSize(lastAttrs, 14);
+            StyleConstants.setBold(lastAttrs, groupBold);
+            StyleConstants.setItalic(lastAttrs, groupItalic);
+            doc.setCharacterAttributes(groupStart, chars.size() - groupStart, lastAttrs, false);
 
             // Restore caret via CRDT char id (accounts for remote inserts shifting offsets)
             int newPos = 0;

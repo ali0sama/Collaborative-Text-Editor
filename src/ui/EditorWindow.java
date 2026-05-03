@@ -728,7 +728,6 @@ public class EditorWindow extends JFrame {
                     updated.addUser(userId, "EDITOR".equalsIgnoreCase(r) ? UserRole.EDITOR : UserRole.VIEWER)
                 );
                 userPanel.setSession(updated);
-                triggerSave();
             } catch (Exception ex) {
                 System.err.println("[EditorWindow] Remote update error: " + ex.getMessage());
             }
