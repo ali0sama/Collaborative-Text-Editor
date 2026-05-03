@@ -58,6 +58,7 @@ public class EditorWindow extends JFrame {
     private final JButton       undoBtn;
     private final JButton       redoBtn;
     private final JButton       shareBtn;
+    private       JButton       disconnectBtn;
 
     private final JLabel statusLabel;
     private final JLabel roleLabel;
@@ -141,6 +142,11 @@ public class EditorWindow extends JFrame {
         connectBtn.setToolTipText("Connect to a collaboration server");
         connectBtn.addActionListener(e -> showConnectDialog());
 
+        disconnectBtn = new JButton("Disconnect");
+        disconnectBtn.setToolTipText("Disconnect from the current session");
+        disconnectBtn.setEnabled(false);
+        disconnectBtn.addActionListener(e -> handleDisconnect());
+
         toolbar.add(boldBtn);
         toolbar.add(italicBtn);
         toolbar.addSeparator();
@@ -151,6 +157,7 @@ public class EditorWindow extends JFrame {
         toolbar.add(joinBtn);
         toolbar.addSeparator();
         toolbar.add(connectBtn);
+        toolbar.add(disconnectBtn);
 
         // --- Status bar
         JPanel southPanel = new JPanel(new BorderLayout());
@@ -503,15 +510,12 @@ public class EditorWindow extends JFrame {
         gbc.insets = new Insets(8, 12, 8, 12);
         gbc.anchor = GridBagConstraints.WEST;
 
-        JTextField   serverField  = new JTextField("ws://127.0.0.1:8081", 20);
-        JTextField   codeField    = new JTextField(12);
+        JTextField serverField = new JTextField("ws://127.0.0.1:8081", 20);
+        JTextField codeField   = new JTextField(12);
         codeField.setFont(new Font("Monospaced", Font.BOLD, 15));
-        JTextField   userIdField  = new JTextField(String.valueOf(localUserID), 8);
-        JRadioButton editorRadio  = new JRadioButton("Editor", true);
-        JRadioButton viewerRadio  = new JRadioButton("Viewer");
-        ButtonGroup  roleGroup    = new ButtonGroup();
-        roleGroup.add(editorRadio);
-        roleGroup.add(viewerRadio);
+        JTextField userIdField = new JTextField(String.valueOf(localUserID), 8);
+        JLabel     roleHint    = new JLabel("(determined by code)");
+        roleHint.setForeground(Color.GRAY);
 
         gbc.gridx = 0; gbc.gridy = 0; dialog.add(new JLabel("Server URL:"), gbc);
         gbc.gridx = 1;               dialog.add(serverField, gbc);
@@ -520,10 +524,7 @@ public class EditorWindow extends JFrame {
         gbc.gridx = 0; gbc.gridy = 2; dialog.add(new JLabel("User ID:"), gbc);
         gbc.gridx = 1;               dialog.add(userIdField, gbc);
         gbc.gridx = 0; gbc.gridy = 3; dialog.add(new JLabel("Role:"), gbc);
-        JPanel rolePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
-        rolePanel.add(editorRadio);
-        rolePanel.add(viewerRadio);
-        gbc.gridx = 1; dialog.add(rolePanel, gbc);
+        gbc.gridx = 1;               dialog.add(roleHint, gbc);
 
         JButton joinBtn = new JButton("Join");
         joinBtn.addActionListener(e -> {
@@ -531,9 +532,9 @@ public class EditorWindow extends JFrame {
             String serverUrl = serverField.getText().trim();
             String uidStr    = userIdField.getText().trim();
 
-            if (code.length() != 8 || !code.matches("[A-Z0-9]+")) {
+            if (code.length() != 8 || !code.matches("[EV][A-Z0-9]{7}")) {
                 JOptionPane.showMessageDialog(dialog,
-                    "Code must be exactly 8 alphanumeric characters (A-Z, 0-9).",
+                    "Invalid code. Editor codes start with E, viewer codes start with V.",
                     "Invalid Code", JOptionPane.ERROR_MESSAGE);
                 return;
             }
@@ -549,12 +550,10 @@ public class EditorWindow extends JFrame {
                 return;
             }
 
-            String role = editorRadio.isSelected() ? "editor" : "viewer";
+            // Role is encoded in the first character of the code: E = editor, V = viewer.
+            String role = ShareCodeManager.isEditorCode(code) ? "editor" : "viewer";
             dialog.dispose();
 
-            // Connect directly to the server using the share code as the session ID.
-            // The document owner must have connected with this same code as their session ID.
-            // The server will replay its operation history so this client reconstructs the document.
             editorPane.clearDocument();
             resetUndoRedo();
             currentDocName    = "Shared Document";
@@ -570,6 +569,15 @@ public class EditorWindow extends JFrame {
         dialog.pack();
         dialog.setLocationRelativeTo(this);
         dialog.setVisible(true);
+    }
+
+    private void handleDisconnect() {
+        if (wsClient != null) {
+            wsClient.disconnectFromServer();
+            wsClient = null;
+        }
+        disconnectBtn.setEnabled(false);
+        setStatus("Disconnected");
     }
 
     // ─── Connect to Server Dialog (WebSocket) ─────────────────────────────────
@@ -730,6 +738,7 @@ public class EditorWindow extends JFrame {
                 System.err.println("[EditorWindow] Remote update error: " + ex.getMessage());
             }
             setStatus("Connected");
+            disconnectBtn.setEnabled(true);
         });
 
         try {
@@ -743,7 +752,10 @@ public class EditorWindow extends JFrame {
             editorPane.setNetworkSender(new NetworkSenderAdapter(wsClient));
             undoRedoManager.setWebSocketClient(wsClient);
             wsClient.setDisconnectCallback(() ->
-                SwingUtilities.invokeLater(() -> setStatus("Disconnected — reconnecting…")));
+                SwingUtilities.invokeLater(() -> {
+                    setStatus("Disconnected — reconnecting…");
+                    disconnectBtn.setEnabled(false);
+                }));
             wsClient.connectToServer();
         } catch (URISyntaxException e) {
             JOptionPane.showMessageDialog(this, "Invalid server URL.", "Error", JOptionPane.ERROR_MESSAGE);
