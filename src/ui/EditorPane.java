@@ -18,6 +18,7 @@ import javax.swing.*;
 import javax.swing.event.*;
 import javax.swing.text.*;
 import operations.*;
+import operations.FormatOperation;
 import serializations.OperationSerializer;
 
 public class EditorPane extends JPanel {
@@ -241,6 +242,17 @@ public class EditorPane extends JPanel {
     // ─── Display Refresh ─────────────────────────────────────────────────────
 
     public void refreshDisplay() {
+        // Before rebuilding, anchor caretCharId to the current visual position if not
+        // already set. This means remote inserts before our cursor will shift it correctly
+        // instead of leaving it at a stale offset.
+        if (caretCharId == null) {
+            int pos = textPane.getCaretPosition();
+            List<CRDTChar> pre = crdt.getVisibleChars();
+            if (pos > 0 && !pre.isEmpty()) {
+                caretCharId = pre.get(Math.min(pos - 1, pre.size() - 1)).id;
+            }
+        }
+
         suppressDocumentEvents = true;
         try {
             List<CRDTChar> chars = crdt.getVisibleChars();
@@ -273,7 +285,7 @@ public class EditorPane extends JPanel {
                 }
             }
 
-            // Restore caret to the same logical CRDT position
+            // Restore caret via CRDT char id (accounts for remote inserts shifting offsets)
             int newPos = 0;
             if (caretCharId != null) {
                 for (int i = 0; i < chars.size(); i++) {
@@ -389,6 +401,15 @@ public class EditorPane extends JPanel {
             if (toggleItalic) {
                 boolean allItalic = selected.stream().allMatch(CRDTChar::isItalic);
                 for (CRDTChar c : selected) crdt.setItalic(c.id, !allItalic);
+            }
+
+            // Broadcast one FormatOperation per affected character so peers update their display
+            if (networkSender != null && networkSender.isConnected()) {
+                for (CRDTChar c : selected) {
+                    int t = clock.tick();
+                    FormatOperation op = new FormatOperation(localUserID, t, c.id, c.isBold(), c.isItalic());
+                    networkSender.sendMessage(buildOperationEnvelope(op));
+                }
             }
             refreshDisplay();
         } else {

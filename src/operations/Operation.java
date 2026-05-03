@@ -8,7 +8,7 @@ public abstract class Operation {
     public final int clock;
 
     public enum Type {
-        INSERT, DELETE
+        INSERT, DELETE, FORMAT
     }
 
     protected Operation(int userID, int clock) {
