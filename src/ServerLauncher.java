@@ -28,7 +28,7 @@ public class ServerLauncher {
             }));
             
             System.out.println("\nServer is READY for connections!");
-            System.out.println("   Clients should connect to: ws://localhost:" + port);
+            System.out.println("   Clients should connect to: ws://YOUR_LAN_IP:" + port);
             System.out.println("\nWaiting for clients...\n");
 
             // Keep launcher process alive until Ctrl+C.
