@@ -11,18 +11,23 @@ import filemanagement.PermissionManager.UserRole;
 public class ShareCodeManager {
 
     public static String generateEditorCode() {
-        return generateRandomAlphanumeric(); // XK3P9MWQ style [cite: 84]
+        return "E" + generateRandomAlphanumeric(7);
     }
 
     public static String generateViewerCode() {
-        return generateRandomAlphanumeric(); 
+        return "V" + generateRandomAlphanumeric(7);
     }
 
-    private static String generateRandomAlphanumeric() {
+    // Returns true if this code grants editor access (first char 'E').
+    public static boolean isEditorCode(String code) {
+        return code != null && code.length() == 8 && code.charAt(0) == 'E';
+    }
+
+    private static String generateRandomAlphanumeric(int length) {
         String chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         StringBuilder sb = new StringBuilder();
         Random rnd = new Random();
-        while (sb.length() < 8) {
+        while (sb.length() < length) {
             sb.append(chars.charAt(rnd.nextInt(chars.length())));
         }
         return sb.toString();
