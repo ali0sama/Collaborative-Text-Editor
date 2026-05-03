@@ -44,6 +44,9 @@ public class WebSocketClient extends org.java_websocket.client.WebSocketClient {
     // Optional callback to refresh UI after remote updates
     private final Runnable refreshCallback;
 
+    // Called when connection drops unexpectedly (not on manual close)
+    private Runnable disconnectCallback;
+
     // Stores latest active users from "userList" messages
     private final Map<Integer, String> activeUsers = Collections.synchronizedMap(new HashMap<>());
 
@@ -101,6 +104,7 @@ public class WebSocketClient extends org.java_websocket.client.WebSocketClient {
     public void onOpen(ServerHandshake handshakedata) {
         System.out.println("[WebSocketClient] Connected to server");
         sendJoinMessage();
+        refreshUI();
     }
 
     /**
@@ -124,6 +128,7 @@ public class WebSocketClient extends org.java_websocket.client.WebSocketClient {
         System.out.println("[WebSocketClient] Connection closed. Code=" + code + ", reason=" + reason);
 
         if (!manualClose) {
+            if (disconnectCallback != null) disconnectCallback.run();
             attemptReconnect();
         }
     }
@@ -134,12 +139,13 @@ public class WebSocketClient extends org.java_websocket.client.WebSocketClient {
     @Override
     public void onError(Exception ex) {
         System.err.println("[WebSocketClient] Error: " + ex.getMessage());
-        ex.printStackTrace();
     }
 
     /**
      * Connect safely.
      */
+    public void setDisconnectCallback(Runnable cb) { this.disconnectCallback = cb; }
+
     public void connectToServer() {
         manualClose = false;
         this.connect();
@@ -226,11 +232,8 @@ public class WebSocketClient extends org.java_websocket.client.WebSocketClient {
             wrapper.add("data", com.google.gson.JsonParser.parseString(operationJson));
 
             send(wrapper.toString());
-            System.out.println("[WebSocketClient] Sent operation: " + wrapper);
-
         } catch (Exception e) {
             System.err.println("[WebSocketClient] Failed to send operation: " + e.getMessage());
-            e.printStackTrace();
         }
     }
 
@@ -268,7 +271,6 @@ public class WebSocketClient extends org.java_websocket.client.WebSocketClient {
         wrapper.add("data", data);
 
         send(wrapper.toString());
-        System.out.println("[WebSocketClient] Sent cursor update: " + wrapper);
     }
 
     /**

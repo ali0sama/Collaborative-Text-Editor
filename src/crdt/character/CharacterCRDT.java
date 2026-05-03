@@ -102,6 +102,24 @@ public class CharacterCRDT {
         return charMap.size();
     }
 
+    /**
+     * Re-inserts a character that was tombstoned by an undo.
+     * If the char is already in charMap (tombstoned), un-tombstones it and restores formatting.
+     * If it's new, falls through to a normal insert.
+     */
+    public void reinsert(CharId id, char value, CharId parentID, boolean bold, boolean italic) {
+        CRDTChar existing = charMap.get(id);
+        if (existing != null) {
+            existing.unmarkDeleted();
+            existing.setBold(bold);
+            existing.setItalic(italic);
+        } else {
+            insert(id, value, parentID);
+            if (bold)   setBold(id, true);
+            if (italic) setItalic(id, true);
+        }
+    }
+
     public void setBold(CharId id, boolean bold) {
         CRDTChar c = charMap.get(id);
         if (c != null && !c.isDeleted())

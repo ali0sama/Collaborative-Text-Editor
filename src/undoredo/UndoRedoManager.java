@@ -13,7 +13,7 @@ import java.util.Deque;
 
 public class UndoRedoManager {
 
-    private static final int MAX_SIZE = 10;
+    private static final int MAX_SIZE = 100;
 
     private final Deque<Operation> undoStack = new ArrayDeque<>();
     private final Deque<Operation> redoStack = new ArrayDeque<>();
@@ -77,7 +77,15 @@ public class UndoRedoManager {
         if (redoStack.isEmpty()) return;
 
         Operation op = redoStack.pop();
-        op.apply(crdt);
+
+        if (op instanceof InsertOperation) {
+            // crdt.insert() is a no-op for tombstoned IDs, so use reinsert() instead
+            InsertOperation ins = (InsertOperation) op;
+            crdt.reinsert(ins.charID, ins.value, ins.parentID, ins.bold, ins.italic);
+        } else {
+            op.apply(crdt);
+        }
+
         undoStack.push(op);
         trimStack(undoStack);
 
