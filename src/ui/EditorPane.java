@@ -535,6 +535,12 @@ private Map<Integer, CharId> lastCursorSnapshot = new java.util.HashMap<>();
             }
         }
         renderRemoteCursors();
+        javax.swing.Timer t = new javax.swing.Timer(50, e -> {
+            renderRemoteCursors();
+            textPane.repaint();
+        });
+        t.setRepeats(false);
+        t.start();
     }
 
     // ─── Envelope Builders ───────────────────────────────────────────────────
