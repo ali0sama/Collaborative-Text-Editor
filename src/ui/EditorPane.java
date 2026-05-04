@@ -43,6 +43,8 @@ public class EditorPane extends JPanel {
 
     private boolean suppressDocumentEvents = false;
     private CharId caretCharId = null;
+private Map<Integer, CharId> lastCursorSnapshot = new java.util.HashMap<>();
+    
 
     // Saved selection so bold/italic buttons work even after losing focus
     private int savedSelStart = 0;
@@ -305,7 +307,7 @@ public class EditorPane extends JPanel {
         } finally {
             suppressDocumentEvents = false;
         }
-        renderRemoteCursors();
+        updateRemoteCursorsFromCharIds(lastCursorSnapshot);
     }
 
     // ─── Remote Cursor Rendering ─────────────────────────────────────────────
@@ -514,6 +516,7 @@ public class EditorPane extends JPanel {
     public void setSessionInfo(String sid, int uid) { this.sessionID = sid; this.localUserID = uid; }
 
     public void updateRemoteCursorsFromCharIds(Map<Integer, CharId> charIdCursors) {
+        lastCursorSnapshot = new java.util.HashMap<>(charIdCursors);
         cursorTracker.clear();
         List<CRDTChar> visible = crdt.getVisibleChars();
         for (Map.Entry<Integer, CharId> entry : charIdCursors.entrySet()) {
