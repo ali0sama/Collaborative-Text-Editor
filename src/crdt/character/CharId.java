@@ -12,12 +12,21 @@ public class CharId implements Comparable<CharId> {
         this.userID = userID;
     }
 
-    @Override
+    // @Override
+    // public int compareTo(CharId other) {
+    //     if (this.counter != other.counter) {
+    //         return Integer.compare(this.counter, other.counter);
+    //     }
+    //     return Integer.compare(this.userID, other.userID);
+    // }
+
+
+        @Override
     public int compareTo(CharId other) {
-        if (this.counter != other.counter) {
-            return Integer.compare(this.counter, other.counter);
+        if (this.userID != other.userID) {
+            return Integer.compare(this.userID, other.userID);
         }
-        return Integer.compare(this.userID, other.userID);
+        return Integer.compare(this.counter, other.counter);
     }
 
     @Override
