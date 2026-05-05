@@ -1,6 +1,7 @@
 package network;
 
 import java.util.Map;
+import java.util.function.Consumer;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -15,268 +16,182 @@ import serializations.OperationSerializer;
  * Handles all incoming WebSocket messages on the client side.
  *
  * Supported server messages:
- * - operation
- * - history
- * - userList
- * - cursor
- *
- * Member 2's server sends wrapped JSON messages, not raw operation JSON.
+ *   operation, history, userList, cursor,
+ *   documentState, fileCreated, fileList, fileSaved, fileRenamed, fileDeleted, error
  */
 public class MessageHandler {
 
-    private final WebSocketClient client;
-    private final CharacterCRDT crdt;
-    private final Clock clock;
+    private final WebSocketClient      client;
+    private final CharacterCRDT        crdt;
+    private final Clock                clock;
     private final Map<Integer, String> activeUsers;
     private final Map<Integer, CharId> remoteCursors;
-    private final Runnable refreshCallback;
+    private final Runnable             refreshCallback;
 
     public MessageHandler(
-            WebSocketClient client,
-            CharacterCRDT crdt,
-            Clock clock,
-            Map<Integer, String> activeUsers,
-            Map<Integer, CharId> remoteCursors,
-            Runnable refreshCallback
-    ) {
-        this.client = client;
-        this.crdt = crdt;
-        this.clock = clock;
-        this.activeUsers = activeUsers;
-        this.remoteCursors = remoteCursors;
+            WebSocketClient client, CharacterCRDT crdt, Clock clock,
+            Map<Integer, String> activeUsers, Map<Integer, CharId> remoteCursors,
+            Runnable refreshCallback) {
+
+        this.client          = client;
+        this.crdt            = crdt;
+        this.clock           = clock;
+        this.activeUsers     = activeUsers;
+        this.remoteCursors   = remoteCursors;
         this.refreshCallback = refreshCallback;
     }
 
-    /**
-     * Main entry point for any raw server message.
-     */
     public void handle(String rawMessage) {
         JsonObject json = JsonParser.parseString(rawMessage).getAsJsonObject();
 
         if (!json.has("action")) {
-            System.err.println("[MessageHandler] Message missing 'action': " + rawMessage);
+            System.err.println("[MessageHandler] Missing 'action': " + rawMessage);
             return;
         }
 
-        String action = json.get("action").getAsString();
-
-        switch (action) {
-            case "operation":
-                handleOperation(json);
+        switch (json.get("action").getAsString()) {
+            case "operation":     handleOperation(json);     break;
+            case "history":       handleHistory(json);       break;
+            case "userList":      handleUserList(json);      break;
+            case "cursor":        handleCursor(json);        break;
+            case "documentState": handleDocumentState(json); break;
+            case "fileInfo":      handleFileInfo(json);      break;
+            case "fileCreated":   handleFileCreated(json);   break;
+            case "fileList":      handleFileList(json);      break;
+            case "fileSaved":     handleFileSaved();         break;
+            case "fileRenamed":   handleFileRenamed(json);   break;
+            case "fileDeleted":   handleFileDeleted();       break;
+            case "error":
+                System.err.println("[MessageHandler] Server error: "
+                        + (json.has("message") ? json.get("message").getAsString() : "unknown"));
                 break;
-
-            case "history":
-                handleHistory(json);
-                break;
-
-            case "userList":
-                handleUserList(json);
-                break;
-
-            case "cursor":
-                handleCursor(json);
-                break;
-
             default:
-                System.err.println("[MessageHandler] Unknown action: " + action);
+                System.err.println("[MessageHandler] Unknown action: "
+                        + json.get("action").getAsString());
         }
     }
 
-    /**
-     * Handle a live operation broadcast from the server.
-     *
-     * Expected shape:
-     * {
-     *   "action": "operation",
-     *   "sessionID": "...",
-     *   "userID": 1,
-     *   "data": { ...operation json... }
-     * }
-     */
+    // ─── Collaboration handlers ───────────────────────────────────────────────
+
     private void handleOperation(JsonObject json) {
         try {
-            if (!json.has("data")) {
-                System.err.println("[MessageHandler] Operation message missing data");
-                return;
-            }
-
-            String operationJson = json.get("data").toString();
-
-            Operation op = OperationSerializer.deserialize(operationJson);
-
-            // Sync logical clock with remote operation
+            String    opJson = json.get("data").toString();
+            Operation op     = OperationSerializer.deserialize(opJson);
             clock.update(op.clock);
-
-            // Apply operation to local CRDT
             op.apply(crdt);
             triggerRefresh();
-
         } catch (Exception e) {
-            System.err.println("[MessageHandler] Failed to handle operation: " + e.getMessage());
-            e.printStackTrace();
+            System.err.println("[MessageHandler] handleOperation failed: " + e.getMessage());
         }
     }
 
-    /**
-     * Handle a history message.
-     *
-     * Member 2 server sends:
-     * {
-     *   "action": "history",
-     *   "count": N,
-     *   "operations": "{...}|{...}|"
-     * }
-     */
     private void handleHistory(JsonObject json) {
         try {
-            if (!json.has("operations")) {
-                System.err.println("[MessageHandler] History message missing operations");
-                return;
-            }
+            String data = json.has("operations") ? json.get("operations").getAsString() : "";
+            if (data.trim().isEmpty()) { triggerRefresh(); return; }
 
-            String operationsData = json.get("operations").getAsString();
-
-            if (operationsData == null || operationsData.trim().isEmpty()) {
-                System.out.println("[MessageHandler] No history to apply");
-                triggerRefresh();
-                return;
-            }
-
-            String[] parts = operationsData.split("\\|");
-
-            for (String opJson : parts) {
-                if (opJson == null || opJson.trim().isEmpty()) {
-                    continue;
-                }
-
+            for (String opJson : data.split("\\|")) {
+                if (opJson.trim().isEmpty()) continue;
                 Operation op = OperationSerializer.deserialize(opJson.trim());
-
-                // Sync logical clock with each remote operation
                 clock.update(op.clock);
-
-                // Apply to CRDT
                 op.apply(crdt);
             }
-
-            System.out.println("[MessageHandler] History applied successfully");
+            System.out.println("[MessageHandler] History applied");
             triggerRefresh();
-
         } catch (Exception e) {
-            System.err.println("[MessageHandler] Failed to handle history: " + e.getMessage());
-            e.printStackTrace();
+            System.err.println("[MessageHandler] handleHistory failed: " + e.getMessage());
         }
     }
 
-    /**
-     * Handle active user list message.
-     *
-     * Member 2 server sends:
-     * {
-     *   "action": "userList",
-     *   "users": "1:EDITOR|2:VIEWER|",
-     *   "count": 2
-     * }
-     */
     private void handleUserList(JsonObject json) {
         try {
             synchronized (activeUsers) {
                 activeUsers.clear();
-
-                if (!json.has("users")) {
-                    triggerRefresh();
-                    return;
-                }
-
-                String usersData = json.get("users").getAsString();
-
-                if (usersData == null || usersData.trim().isEmpty()) {
-                    triggerRefresh();
-                    return;
-                }
-
-                String[] userEntries = usersData.split("\\|");
-
-                for (String entry : userEntries) {
-                    if (entry == null || entry.trim().isEmpty()) {
-                        continue;
-                    }
-
+                if (!json.has("users")) { triggerRefresh(); return; }
+                for (String entry : json.get("users").getAsString().split("\\|")) {
+                    if (entry.trim().isEmpty()) continue;
                     String[] parts = entry.split(":");
-                    if (parts.length != 2) {
-                        continue;
-                    }
-
-                    int userID = Integer.parseInt(parts[0].trim());
-                    String role = parts[1].trim();
-
-                    activeUsers.put(userID, role);
+                    if (parts.length == 2)
+                        activeUsers.put(Integer.parseInt(parts[0].trim()), parts[1].trim());
                 }
             }
-
             triggerRefresh();
-
         } catch (Exception e) {
-            System.err.println("[MessageHandler] Failed to handle user list: " + e.getMessage());
-            e.printStackTrace();
+            System.err.println("[MessageHandler] handleUserList failed: " + e.getMessage());
         }
     }
 
-    /**
-     * Handle cursor updates.
-     *
-     * Expected shape:
-     * {
-     *   "action": "cursor",
-     *   "sessionID": "...",
-     *   "userID": 2,
-     *   "data": {
-     *      "afterUserID": 1,
-     *      "afterClock": 3
-     *   }
-     * }
-     */
     private void handleCursor(JsonObject json) {
         try {
-            if (!json.has("userID") || !json.has("data")) {
-                System.err.println("[MessageHandler] Cursor message missing fields");
-                return;
-            }
-
-            int senderUserID = json.get("userID").getAsInt();
-
-            // Ignore our own echoed cursor if ever received
-            if (senderUserID == client.getUserID()) {
-                return;
-            }
+            if (!json.has("userID") || !json.has("data")) return;
+            int senderID = json.get("userID").getAsInt();
+            if (senderID == client.getUserID()) return;
 
             JsonObject data = json.getAsJsonObject("data");
-
             int afterUserID = data.get("afterUserID").getAsInt();
-            int afterClock = data.get("afterClock").getAsInt();
+            int afterClock  = data.get("afterClock").getAsInt();
+            CharId position = (afterUserID == -1 || afterClock == -1)
+                    ? null : new CharId(afterClock, afterUserID);
 
-            CharId position = null;
-            if (afterUserID != -1 && afterClock != -1) {
-                position = new CharId(afterClock, afterUserID);
-            }
-
-            synchronized (remoteCursors) {
-                remoteCursors.put(senderUserID, position);
-            }
-
+            synchronized (remoteCursors) { remoteCursors.put(senderID, position); }
             triggerRefresh();
-
         } catch (Exception e) {
-            System.err.println("[MessageHandler] Failed to handle cursor update: " + e.getMessage());
-            e.printStackTrace();
+            System.err.println("[MessageHandler] handleCursor failed: " + e.getMessage());
         }
     }
 
-    /**
-     * Triggers UI refresh if available.
-     */
-    private void triggerRefresh() {
-        if (refreshCallback != null) {
-            refreshCallback.run();
+    // ─── Document state (sent on join when no in-memory history) ─────────────
+
+    private void handleDocumentState(JsonObject json) {
+        try {
+            String crdtJson = json.get("crdtJson").getAsString();
+            Consumer<String> cb = client.getDocumentStateCallback();
+            if (cb != null) cb.accept(crdtJson);
+            triggerRefresh();
+        } catch (Exception e) {
+            System.err.println("[MessageHandler] handleDocumentState failed: " + e.getMessage());
         }
+    }
+
+    // ─── File operation response handlers ────────────────────────────────────
+
+    private void handleFileInfo(JsonObject json) {
+        Consumer<JsonObject> cb = client.getFileInfoCallback();
+        if (cb != null) cb.accept(json);
+    }
+
+    private void handleFileCreated(JsonObject json) {
+        Consumer<JsonObject> cb = client.getAndClearFileCreatedCallback();
+        if (cb != null) cb.accept(json);
+    }
+
+    private void handleFileList(JsonObject json) {
+        Consumer<JsonObject> cb = client.getAndClearFileListCallback();
+        if (cb != null) cb.accept(json);
+    }
+
+    private void handleFileSaved() {
+        Runnable cb = client.getAndClearFileSavedCallback();
+        if (cb != null) cb.run();
+    }
+
+    private void handleFileRenamed(JsonObject json) {
+        String newName = json.has("newName") ? json.get("newName").getAsString() : null;
+        if (newName == null) return;
+        Consumer<String> cb = client.getFileRenamedCallback();
+        if (cb != null) cb.accept(newName);
+        triggerRefresh();
+    }
+
+    private void handleFileDeleted() {
+        Runnable cb = client.getFileDeletedCallback();
+        if (cb != null) cb.run();
+        triggerRefresh();
+    }
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    private void triggerRefresh() {
+        if (refreshCallback != null) refreshCallback.run();
     }
 }

@@ -1,110 +1,198 @@
 package database;
 
-import java.sql.*;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.MongoCursor;
+import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.IndexOptions;
+import com.mongodb.client.model.Indexes;
+import com.mongodb.client.model.ReplaceOptions;
+import com.mongodb.client.model.Updates;
+import org.bson.Document;
+
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Persistence layer backed by MongoDB.
+ *
+ * Database : collab_editor
+ * Collection: documents
+ *
+ * Each document has the shape:
+ * {
+ *   "id"         : "<UUID>",
+ *   "name"       : "My File",
+ *   "editorCode" : "EXXXXXXX",
+ *   "viewerCode" : "VXXXXXXX",
+ *   "createdAt"  : <epoch ms>,
+ *   "crdtJson"   : "<serialized BlockCRDT>"   // updated separately
+ * }
+ *
+ * The public interface is unchanged from the SQLite version so FileRepository
+ * and everything above it requires no modification.
+ */
 public class DatabaseManager {
 
-    private static final String DB_URL = "jdbc:sqlite:collab_editor.db";
-    private Connection connection;
+    private static final String CONNECTION_STRING = "mongodb://localhost:27017";
+    private static final String DATABASE_NAME     = "collab_editor";
+    private static final String COLLECTION_NAME   = "documents";
+
+    private MongoClient                mongoClient;
+    private MongoCollection<Document>  collection;
+
+    // ─── Lifecycle ────────────────────────────────────────────────────────────
 
     public void connect() throws SQLException {
-        connection = DriverManager.getConnection(DB_URL);
-        createTablesIfNeeded();
+        try {
+            mongoClient = MongoClients.create(CONNECTION_STRING);
+            MongoDatabase db = mongoClient.getDatabase(DATABASE_NAME);
+            collection = db.getCollection(COLLECTION_NAME);
+            // Unique index on "id" field for fast lookups and upsert safety
+            collection.createIndex(Indexes.ascending("id"),
+                    new IndexOptions().unique(true));
+        } catch (Exception e) {
+            throw new SQLException("MongoDB connect failed: " + e.getMessage(), e);
+        }
     }
 
     public void disconnect() throws SQLException {
-        if (connection != null && !connection.isClosed()) {
-            connection.close();
+        if (mongoClient != null) {
+            try { mongoClient.close(); } catch (Exception ignored) {}
         }
     }
 
-    private void createTablesIfNeeded() throws SQLException {
-        String docsTable =
-            "CREATE TABLE IF NOT EXISTS documents (" +
-            "  id          TEXT PRIMARY KEY," +
-            "  name        TEXT NOT NULL," +
-            "  editor_code TEXT NOT NULL," +
-            "  viewer_code TEXT NOT NULL," +
-            "  created_at  INTEGER NOT NULL" +
-            ")";
+    // ─── Documents ───────────────────────────────────────────────────────────
 
-        String crdtTable =
-            "CREATE TABLE IF NOT EXISTS crdt_state (" +
-            "  doc_id    TEXT NOT NULL," +
-            "  crdt_json TEXT NOT NULL," +
-            "  saved_at  INTEGER NOT NULL," +
-            "  PRIMARY KEY (doc_id)" +
-            ")";
+    /**
+     * Upserts the document metadata (does not touch crdtJson).
+     */
+    public void saveDocument(String docId, String name,
+                             String editorCode, String viewerCode) throws SQLException {
+        try {
+            Document doc = new Document("id", docId)
+                    .append("name",       name)
+                    .append("editorCode", editorCode)
+                    .append("viewerCode", viewerCode)
+                    .append("createdAt",  System.currentTimeMillis());
 
-        try (Statement stmt = connection.createStatement()) {
-            stmt.execute(docsTable);
-            stmt.execute(crdtTable);
+            collection.replaceOne(
+                    Filters.eq("id", docId),
+                    doc,
+                    new ReplaceOptions().upsert(true));
+        } catch (Exception e) {
+            throw new SQLException("saveDocument failed: " + e.getMessage(), e);
         }
     }
 
-    public void saveDocument(String docId, String name, String editorCode, String viewerCode)
-            throws SQLException {
-        String sql = "INSERT OR REPLACE INTO documents (id, name, editor_code, viewer_code, created_at) " +
-                     "VALUES (?, ?, ?, ?, ?)";
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            ps.setString(1, docId);
-            ps.setString(2, name);
-            ps.setString(3, editorCode);
-            ps.setString(4, viewerCode);
-            ps.setLong(5, System.currentTimeMillis());
-            ps.executeUpdate();
-        }
-    }
-
+    /**
+     * Returns all documents as [id, name, editorCode, viewerCode] arrays.
+     */
     public List<String[]> loadAllDocuments() throws SQLException {
-        String sql = "SELECT id, name, editor_code, viewer_code FROM documents";
-        List<String[]> records = new ArrayList<>();
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery(sql)) {
-            while (rs.next()) {
-                records.add(new String[]{
-                    rs.getString("id"),
-                    rs.getString("name"),
-                    rs.getString("editor_code"),
-                    rs.getString("viewer_code")
-                });
+        try {
+            List<String[]> records = new ArrayList<>();
+            try (MongoCursor<Document> cursor = collection.find().iterator()) {
+                while (cursor.hasNext()) {
+                    Document d = cursor.next();
+                    records.add(new String[]{
+                        d.getString("id"),
+                        d.getString("name"),
+                        d.getString("editorCode"),
+                        d.getString("viewerCode")
+                    });
+                }
             }
+            return records;
+        } catch (Exception e) {
+            throw new SQLException("loadAllDocuments failed: " + e.getMessage(), e);
         }
-        return records;
+    }
+
+    public void renameDocument(String docId, String newName) throws SQLException {
+        try {
+            collection.updateOne(
+                    Filters.eq("id", docId),
+                    Updates.set("name", newName));
+        } catch (Exception e) {
+            throw new SQLException("renameDocument failed: " + e.getMessage(), e);
+        }
     }
 
     public void deleteDocument(String docId) throws SQLException {
-        try (PreparedStatement ps1 = connection.prepareStatement("DELETE FROM documents WHERE id = ?");
-             PreparedStatement ps2 = connection.prepareStatement("DELETE FROM crdt_state WHERE doc_id = ?")) {
-            ps1.setString(1, docId);
-            ps1.executeUpdate();
-            ps2.setString(1, docId);
-            ps2.executeUpdate();
+        try {
+            collection.deleteOne(Filters.eq("id", docId));
+        } catch (Exception e) {
+            throw new SQLException("deleteDocument failed: " + e.getMessage(), e);
         }
     }
 
+    // ─── CRDT State ───────────────────────────────────────────────────────────
+
+    /**
+     * Saves (or updates) the serialized CRDT JSON for a document.
+     * Uses updateOne so the document metadata written by saveDocument is preserved.
+     */
     public void saveCRDTState(String docId, String crdtJson) throws SQLException {
-        String sql = "INSERT OR REPLACE INTO crdt_state (doc_id, crdt_json, saved_at) VALUES (?, ?, ?)";
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            ps.setString(1, docId);
-            ps.setString(2, crdtJson);
-            ps.setLong(3, System.currentTimeMillis());
-            ps.executeUpdate();
+        try {
+            collection.updateOne(
+                    Filters.eq("id", docId),
+                    Updates.set("crdtJson", crdtJson));
+        } catch (Exception e) {
+            throw new SQLException("saveCRDTState failed: " + e.getMessage(), e);
         }
     }
 
+    /**
+     * Loads the serialized CRDT JSON for a document, or null if not found.
+     */
     public String loadCRDTState(String docId) throws SQLException {
-        String sql = "SELECT crdt_json FROM crdt_state WHERE doc_id = ?";
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            ps.setString(1, docId);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    return rs.getString("crdt_json");
-                }
-            }
+        try {
+            Document d = collection.find(Filters.eq("id", docId)).first();
+            return (d == null) ? null : d.getString("crdtJson");
+        } catch (Exception e) {
+            throw new SQLException("loadCRDTState failed: " + e.getMessage(), e);
         }
-        return null;
+    }
+
+    /**
+     * Finds a document by the 7-character session ID (the shared suffix of
+     * editorCode and viewerCode). Returns [id, name, editorCode, viewerCode]
+     * or null if not found.
+     */
+    public String[] findBySessionId(String sessionId) throws SQLException {
+        try {
+            Document d = collection.find(Filters.or(
+                Filters.eq("editorCode", "E" + sessionId),
+                Filters.eq("viewerCode", "V" + sessionId)
+            )).first();
+            if (d == null) return null;
+            return new String[]{
+                d.getString("id"),
+                d.getString("name"),
+                d.getString("editorCode"),
+                d.getString("viewerCode")
+            };
+        } catch (Exception e) {
+            throw new SQLException("findBySessionId failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Returns the serialized CRDT JSON for the document identified by its
+     * 7-character session ID, or null if not found.
+     */
+    public String loadCrdtBySessionId(String sessionId) throws SQLException {
+        try {
+            Document d = collection.find(Filters.or(
+                Filters.eq("editorCode", "E" + sessionId),
+                Filters.eq("viewerCode", "V" + sessionId)
+            )).first();
+            return (d == null) ? null : d.getString("crdtJson");
+        } catch (Exception e) {
+            throw new SQLException("loadCrdtBySessionId failed: " + e.getMessage(), e);
+        }
     }
 }

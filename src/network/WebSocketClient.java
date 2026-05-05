@@ -5,17 +5,19 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 import org.java_websocket.handshake.ServerHandshake;
 
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 import crdt.character.CharId;
 import crdt.character.CharacterCRDT;
 import crdt.utils.Clock;
+import operations.Operation;
+import serializations.OperationSerializer;
 import session.CollaborationSession.UserRole;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 
 /**
  * Client-side WebSocket for the collaborative editor.
@@ -23,127 +25,101 @@ import com.google.gson.JsonParser;
  * Responsibilities:
  * - Connect to the central WebSocket server
  * - Join a collaboration session
- * - Send operations
- * - Receive operations/history/user list/cursor updates
+ * - Send operations, cursor updates
+ * - Send file operations (create, list, save, rename, delete) to the server
+ * - Receive all of the above and route via MessageHandler + callbacks
  * - Reconnect automatically when the connection drops
- *
- * This class is written to work even before Member 4 finishes the UI.
- * UI refresh is handled through a Runnable callback.
  */
 public class WebSocketClient extends org.java_websocket.client.WebSocketClient {
 
-    private final String sessionID;
-    private final int userID;
+    private final String   sessionID;
+    private final int      userID;
     private final UserRole role;
 
     private final CharacterCRDT crdt;
-    private final Clock clock;
-
+    private final Clock         clock;
     private final MessageHandler messageHandler;
+    private final Runnable       refreshCallback;
+    private       Runnable       disconnectCallback;
 
-    // Optional callback to refresh UI after remote updates
-    private final Runnable refreshCallback;
+    private final Map<Integer, String> activeUsers    = Collections.synchronizedMap(new HashMap<>());
+    private final Map<Integer, CharId> remoteCursors  = Collections.synchronizedMap(new HashMap<>());
 
-    // Called when connection drops unexpectedly (not on manual close)
-    private Runnable disconnectCallback;
+    // Auto-reconnect
+    private final AtomicBoolean reconnecting       = new AtomicBoolean(false);
+    private volatile boolean    manualClose        = false;
+    private final int           reconnectDelayMillis = 3000;
 
-    // Stores latest active users from "userList" messages
-    private final Map<Integer, String> activeUsers = Collections.synchronizedMap(new HashMap<>());
+    // ─── File-operation callbacks (one-shot: cleared after use) ──────────────
+    private volatile Consumer<JsonObject> fileCreatedCallback;
+    private volatile Consumer<JsonObject> fileListCallback;
+    private volatile Runnable             fileSavedCallback;
 
-    // Stores latest remote cursor positions
-    private final Map<Integer, CharId> remoteCursors = Collections.synchronizedMap(new HashMap<>());
+    // ─── Persistent callbacks (set once, stay for the session) ───────────────
+    private volatile Consumer<JsonObject> fileInfoCallback;
+    private volatile Consumer<String>     documentStateCallback;
+    private volatile Consumer<String>     fileRenamedCallback;
+    private volatile Runnable             fileDeletedCallback;
 
-    // Auto-reconnect control
-    private final AtomicBoolean reconnecting = new AtomicBoolean(false);
-    private volatile boolean manualClose = false;
-    private final int reconnectDelayMillis = 3000;
+    // ─── Constructor ─────────────────────────────────────────────────────────
 
-    /**
-     * Constructor
-     *
-     * @param serverUri       e.g. ws://localhost:8080
-     * @param sessionID       document/session ID
-     * @param userID          local user ID
-     * @param role            EDITOR or VIEWER
-     * @param crdt            local CharacterCRDT
-     * @param clock           local logical clock
-     * @param refreshCallback optional UI refresh callback (can be null)
-     */
     public WebSocketClient(
-            URI serverUri,
-            String sessionID,
-            int userID,
-            UserRole role,
-            CharacterCRDT crdt,
-            Clock clock,
-            Runnable refreshCallback
-    ) {
+            URI serverUri, String sessionID, int userID, UserRole role,
+            CharacterCRDT crdt, Clock clock, Runnable refreshCallback) {
+
         super(serverUri);
-        this.sessionID = sessionID;
-        this.userID = userID;
-        this.role = role;
-        this.crdt = crdt;
-        this.clock = clock;
+        this.sessionID       = sessionID;
+        this.userID          = userID;
+        this.role            = role;
+        this.crdt            = crdt;
+        this.clock           = clock;
         this.refreshCallback = refreshCallback;
 
         this.messageHandler = new MessageHandler(
-                this,
-                crdt,
-                clock,
-                activeUsers,
-                remoteCursors,
-                refreshCallback
-        );
+                this, crdt, clock, activeUsers, remoteCursors, refreshCallback);
     }
 
-    /**
-     * Called when connection is opened.
-     * Sends a JOIN message immediately.
-     */
+    // ─── WebSocket lifecycle ─────────────────────────────────────────────────
+
+    // Fired once immediately after the connection opens (used for auto-actions like createFile)
+    private volatile Runnable onConnectedCallback;
+    public void setOnConnectedCallback(Runnable cb) { this.onConnectedCallback = cb; }
+
     @Override
     public void onOpen(ServerHandshake handshakedata) {
         System.out.println("[WebSocketClient] Connected to server");
         sendJoinMessage();
         refreshUI();
+        Runnable cb = onConnectedCallback;
+        onConnectedCallback = null;
+        if (cb != null) cb.run();
     }
 
-    /**
-     * Called when a message is received from the server.
-     */
     @Override
     public void onMessage(String message) {
         try {
             messageHandler.handle(message);
         } catch (Exception e) {
             System.err.println("[WebSocketClient] Failed to handle message: " + e.getMessage());
-            e.printStackTrace();
         }
     }
 
-    /**
-     * Called when the connection closes.
-     */
     @Override
     public void onClose(int code, String reason, boolean remote) {
         System.out.println("[WebSocketClient] Connection closed. Code=" + code + ", reason=" + reason);
-
         if (!manualClose) {
             if (disconnectCallback != null) disconnectCallback.run();
             attemptReconnect();
         }
     }
 
-    /**
-     * Called on WebSocket error.
-     */
     @Override
     public void onError(Exception ex) {
         System.err.println("[WebSocketClient] Error: " + ex.getMessage());
     }
 
-    /**
-     * Connect safely.
-     */
+    // ─── Connect / disconnect ─────────────────────────────────────────────────
+
     public void setDisconnectCallback(Runnable cb) { this.disconnectCallback = cb; }
 
     public void connectToServer() {
@@ -151,148 +127,149 @@ public class WebSocketClient extends org.java_websocket.client.WebSocketClient {
         this.connect();
     }
 
-    /**
-     * Close safely without triggering auto-reconnect.
-     */
     public void disconnectFromServer() {
         manualClose = true;
         this.close();
     }
 
-    /**
-     * Sends the JOIN message required by Member 2's server.
-     *
-     * Format:
-     * {
-     *   "action": "join",
-     *   "sessionID": "...",
-     *   "userID": 1,
-     *   "role": "editor"
-     * }
-     */
+    // ─── Collaboration messages ───────────────────────────────────────────────
+
     private void sendJoinMessage() {
         JsonObject json = new JsonObject();
-        json.addProperty("action", "join");
+        json.addProperty("action",    "join");
         json.addProperty("sessionID", sessionID);
-        json.addProperty("userID", userID);
-        json.addProperty("role", role.name().toLowerCase());
-
+        json.addProperty("userID",    userID);
+        json.addProperty("role",      role.name().toLowerCase());
         send(json.toString());
-        System.out.println("[WebSocketClient] Sent join message: " + json);
+        System.out.println("[WebSocketClient] Sent join: " + json);
     }
 
-    /**
-     * Request full history explicitly if needed.
-     * Server already sends history after join, but this is still useful.
-     */
     public void requestHistory() {
-        if (!isOpen()) {
-            System.err.println("[WebSocketClient] Cannot request history: connection is not open");
-            return;
-        }
-
+        if (!isOpen()) return;
         JsonObject json = new JsonObject();
-        json.addProperty("action", "getHistory");
+        json.addProperty("action",    "getHistory");
         json.addProperty("sessionID", sessionID);
-        json.addProperty("userID", userID);
-
+        json.addProperty("userID",    userID);
         send(json.toString());
-        System.out.println("[WebSocketClient] Requested history");
     }
 
-    /**
-     * Send an operation to the server.
-     *
-     * Message format:
-     * {
-     *   "action": "operation",
-     *   "sessionID": "doc1",
-     *   "userID": 1,
-     *   "data": { ...operation json... }
-     * }
-     */
-    public void sendOperation(operations.Operation operation) {
-        if (!isOpen()) {
-            System.err.println("[WebSocketClient] Cannot send operation: connection is not open");
-            return;
-        }
-
-        if (role == UserRole.VIEWER) {
-            System.err.println("[WebSocketClient] Viewer cannot send edit operations");
-            return;
-        }
-
+    public void sendOperation(Operation operation) {
+        if (!isOpen())              return;
+        if (role == UserRole.VIEWER) return;
         try {
-            String operationJson = serializations.OperationSerializer.serialize(operation);
-
+            String opJson = OperationSerializer.serialize(operation);
             JsonObject wrapper = new JsonObject();
-            wrapper.addProperty("action", "operation");
+            wrapper.addProperty("action",    "operation");
             wrapper.addProperty("sessionID", sessionID);
-            wrapper.addProperty("userID", userID);
-            wrapper.add("data", com.google.gson.JsonParser.parseString(operationJson));
-
+            wrapper.addProperty("userID",    userID);
+            wrapper.add("data", JsonParser.parseString(opJson));
             send(wrapper.toString());
         } catch (Exception e) {
-            System.err.println("[WebSocketClient] Failed to send operation: " + e.getMessage());
+            System.err.println("[WebSocketClient] sendOperation failed: " + e.getMessage());
         }
     }
 
-    /**
-     * Send a cursor update.
-     *
-     * data:
-     * {
-     *   "afterUserID": ...,
-     *   "afterClock": ...
-     * }
-     *
-     * If cursor is at document start, both values are -1.
-     */
     public void sendCursorPosition(CharId afterCharID) {
-        if (!isOpen()) {
-            System.err.println("[WebSocketClient] Cannot send cursor update: connection is not open");
-            return;
-        }
-
+        if (!isOpen()) return;
         JsonObject data = new JsonObject();
-
         if (afterCharID == null) {
             data.addProperty("afterUserID", -1);
-            data.addProperty("afterClock", -1);
+            data.addProperty("afterClock",  -1);
         } else {
             data.addProperty("afterUserID", afterCharID.userID);
-            data.addProperty("afterClock", afterCharID.counter);
+            data.addProperty("afterClock",  afterCharID.counter);
         }
-
         JsonObject wrapper = new JsonObject();
-        wrapper.addProperty("action", "cursor");
+        wrapper.addProperty("action",    "cursor");
         wrapper.addProperty("sessionID", sessionID);
-        wrapper.addProperty("userID", userID);
+        wrapper.addProperty("userID",    userID);
         wrapper.add("data", data);
-
         send(wrapper.toString());
     }
 
-    /**
-     * Try to reconnect automatically after a connection drop.
-     */
-    private void attemptReconnect() {
-        if (!reconnecting.compareAndSet(false, true)) {
-            return;
-        }
+    // ─── File operation messages ──────────────────────────────────────────────
 
+    public void sendCreateFile(String name, Consumer<JsonObject> callback) {
+        if (!isOpen()) return;
+        this.fileCreatedCallback = callback;
+        JsonObject msg = new JsonObject();
+        msg.addProperty("action", "createFile");
+        msg.addProperty("userID", userID);
+        msg.addProperty("name",   name);
+        send(msg.toString());
+    }
+
+    public void sendListFiles(Consumer<JsonObject> callback) {
+        if (!isOpen()) return;
+        this.fileListCallback = callback;
+        JsonObject msg = new JsonObject();
+        msg.addProperty("action", "listFiles");
+        msg.addProperty("userID", userID);
+        send(msg.toString());
+    }
+
+    public void sendSaveFile(String crdtJson, Runnable callback) {
+        if (!isOpen()) return;
+        this.fileSavedCallback = callback;
+        JsonObject msg = new JsonObject();
+        msg.addProperty("action",    "saveFile");
+        msg.addProperty("sessionID", sessionID);
+        msg.addProperty("crdtJson",  crdtJson);
+        send(msg.toString());
+    }
+
+    public void sendRenameFile(String newName) {
+        if (!isOpen()) return;
+        JsonObject msg = new JsonObject();
+        msg.addProperty("action",    "renameFile");
+        msg.addProperty("sessionID", sessionID);
+        msg.addProperty("newName",   newName);
+        send(msg.toString());
+    }
+
+    public void sendDeleteFile() {
+        if (!isOpen()) return;
+        JsonObject msg = new JsonObject();
+        msg.addProperty("action",    "deleteFile");
+        msg.addProperty("sessionID", sessionID);
+        send(msg.toString());
+    }
+
+    // ─── Callback setters (persistent) ───────────────────────────────────────
+
+    public void setFileInfoCallback(Consumer<JsonObject> cb)    { this.fileInfoCallback      = cb; }
+    public void setDocumentStateCallback(Consumer<String> cb)   { this.documentStateCallback = cb; }
+    public void setFileRenamedCallback(Consumer<String> cb)     { this.fileRenamedCallback   = cb; }
+    public void setFileDeletedCallback(Runnable cb)             { this.fileDeletedCallback   = cb; }
+
+    // ─── Callback getters / clearers (used by MessageHandler) ────────────────
+
+    public Consumer<JsonObject> getAndClearFileCreatedCallback() {
+        Consumer<JsonObject> cb = fileCreatedCallback; fileCreatedCallback = null; return cb;
+    }
+    public Consumer<JsonObject> getAndClearFileListCallback() {
+        Consumer<JsonObject> cb = fileListCallback; fileListCallback = null; return cb;
+    }
+    public Runnable getAndClearFileSavedCallback() {
+        Runnable cb = fileSavedCallback; fileSavedCallback = null; return cb;
+    }
+    public Consumer<JsonObject> getFileInfoCallback()      { return fileInfoCallback;      }
+    public Consumer<String>    getDocumentStateCallback() { return documentStateCallback; }
+    public Consumer<String>    getFileRenamedCallback()   { return fileRenamedCallback;   }
+    public Runnable            getFileDeletedCallback()   { return fileDeletedCallback;   }
+
+    // ─── Auto-reconnect ───────────────────────────────────────────────────────
+
+    private void attemptReconnect() {
+        if (!reconnecting.compareAndSet(false, true)) return;
         new Thread(() -> {
             try {
                 while (!manualClose && !isOpen()) {
                     System.out.println("[WebSocketClient] Reconnecting in " + reconnectDelayMillis + " ms...");
                     Thread.sleep(reconnectDelayMillis);
-
                     try {
                         this.reconnectBlocking();
-                        if (isOpen()) {
-                            System.out.println("[WebSocketClient] Reconnected successfully");
-                            break;
-                        }
+                        if (isOpen()) { System.out.println("[WebSocketClient] Reconnected"); break; }
                     } catch (Exception e) {
                         System.err.println("[WebSocketClient] Reconnect failed: " + e.getMessage());
                     }
@@ -305,65 +282,23 @@ public class WebSocketClient extends org.java_websocket.client.WebSocketClient {
         }, "WebSocketClient-Reconnect-Thread").start();
     }
 
-    /**
-     * Refresh UI if callback exists.
-     */
+    // ─── Misc ─────────────────────────────────────────────────────────────────
+
     public void refreshUI() {
-        if (refreshCallback != null) {
-            refreshCallback.run();
-        }
+        if (refreshCallback != null) refreshCallback.run();
     }
 
-    /**
-     * Get latest visible text from CRDT.
-     */
-    public String getDocumentText() {
-        return crdt.getDocument();
-    }
+    public String getServerUrl()                          { return getURI().toString(); }
+    public String getDocumentText()                       { return crdt.getDocument(); }
+    public int    getUserID()                             { return userID; }
+    public String getSessionID()                          { return sessionID; }
+    public CharacterCRDT getCRDT()                        { return crdt; }
+    public Clock         getClock()                       { return clock; }
 
-    /**
-     * Get immutable copy of active users.
-     */
     public Map<Integer, String> getActiveUsersSnapshot() {
-        synchronized (activeUsers) {
-            return new HashMap<>(activeUsers);
-        }
+        synchronized (activeUsers) { return new HashMap<>(activeUsers); }
     }
-
-    /**
-     * Get immutable copy of remote cursors.
-     */
     public Map<Integer, CharId> getRemoteCursorsSnapshot() {
-        synchronized (remoteCursors) {
-            return new HashMap<>(remoteCursors);
-        }
-    }
-
-    /**
-     * Local user ID getter.
-     */
-    public int getUserID() {
-        return userID;
-    }
-
-    /**
-     * Session ID getter.
-     */
-    public String getSessionID() {
-        return sessionID;
-    }
-
-    /**
-     * CRDT getter if needed externally.
-     */
-    public CharacterCRDT getCRDT() {
-        return crdt;
-    }
-
-    /**
-     * Clock getter if needed externally.
-     */
-    public Clock getClock() {
-        return clock;
+        synchronized (remoteCursors) { return new HashMap<>(remoteCursors); }
     }
 }

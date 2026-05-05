@@ -10,12 +10,23 @@ import filemanagement.PermissionManager.UserRole;
 
 public class ShareCodeManager {
 
-    public static String generateEditorCode() {
-        return "E" + generateRandomAlphanumeric(7);
+    /**
+     * Generates a linked pair of codes that share the same 7-character suffix.
+     * index 0 = editor code (E + suffix), index 1 = viewer code (V + suffix).
+     * The shared suffix is the session ID — both codes route to the same server session.
+     */
+    public static String[] generateLinkedCodes() {
+        String suffix = generateRandomAlphanumeric(7);
+        return new String[]{"E" + suffix, "V" + suffix};
     }
 
-    public static String generateViewerCode() {
-        return "V" + generateRandomAlphanumeric(7);
+    /**
+     * Extracts the session ID from any share code by stripping the role prefix.
+     * "EABC1234" and "VABC1234" both return "ABC1234" — the same session.
+     */
+    public static String extractSessionId(String code) {
+        if (code != null && code.length() == 8) return code.substring(1);
+        return code;
     }
 
     // Returns true if this code grants editor access (first char 'E').

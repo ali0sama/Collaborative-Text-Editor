@@ -2,6 +2,11 @@ plugins {
     id 'java'
 }
 
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
 repositories {
     mavenCentral()
 }
@@ -10,7 +15,9 @@ dependencies {
     implementation fileTree(dir: 'lib', include: ['*.jar'])
     implementation 'com.google.code.gson:gson:2.10.1'
     implementation 'org.java-websocket:Java-WebSocket:1.5.6'
-    implementation 'org.xerial:sqlite-jdbc:3.45.1.0'
+    implementation 'org.mongodb:bson:5.1.4'
+    implementation 'org.mongodb:mongodb-driver-core:5.1.4'
+    implementation 'org.mongodb:mongodb-driver-sync:5.1.4'
 }
 
 sourceSets {

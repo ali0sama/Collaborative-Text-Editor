@@ -3,8 +3,14 @@
     "src"
   ],
   "java.project.referencedLibraries": [
-    "lib/**/*.jar",
-    "c:\\gson-2.11.0.jar",
-    "c:\\Java-WebSocket-1.5.7.jar"
-  ]
+    "lib/**/*.jar"
+  ],
+  "java.configuration.runtimes": [
+    {
+      "name": "JavaSE-25",
+      "path": "C:\\Program Files\\Java\\jdk-25",
+      "default": true
+    }
+  ],
+  "java.compile.nullAnalysis.mode": "disabled"
 }
