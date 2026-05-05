@@ -514,22 +514,37 @@ public class EditorPane extends JPanel {
     public void setSessionInfo(String sid, int uid) { this.sessionID = sid; this.localUserID = uid; }
 
     public void updateRemoteCursorsFromCharIds(Map<Integer, CharId> charIdCursors) {
-        cursorTracker.clear();
+        // Remove cursors for users no longer present
+        for (Integer uid : new java.util.ArrayList<>(cursorTracker.getAll().keySet())) {
+            if (!charIdCursors.containsKey(uid)) cursorTracker.remove(uid);
+        }
+
         List<CRDTChar> visible = crdt.getVisibleChars();
         for (Map.Entry<Integer, CharId> entry : charIdCursors.entrySet()) {
+            int    uid = entry.getKey();
             CharId cid = entry.getValue();
+
             if (cid == null) {
-                cursorTracker.update(entry.getKey(), 0);
+                cursorTracker.update(uid, 0);
             } else {
-                boolean found = false;
+                // Search for the anchor character in the visible list
                 for (int i = 0; i < visible.size(); i++) {
                     if (visible.get(i).id.equals(cid)) {
-                        cursorTracker.update(entry.getKey(), i + 1);
-                        found = true; break;
+                        cursorTracker.update(uid, i + 1);
+                        break;
+                        // If not found: keep old position — the char may not have
+                        // arrived yet (race) or was deleted. Do NOT jump to end.
                     }
                 }
-                if (!found) cursorTracker.update(entry.getKey(), visible.size());
             }
+        }
+        renderRemoteCursors();
+    }
+
+    /** Remove cursor entries for users who are no longer in the active set. */
+    public void clearCursorsNotIn(java.util.Set<Integer> activeUserIds) {
+        for (Integer uid : new java.util.ArrayList<>(cursorTracker.getAll().keySet())) {
+            if (!activeUserIds.contains(uid)) cursorTracker.remove(uid);
         }
         renderRemoteCursors();
     }

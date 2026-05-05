@@ -35,6 +35,10 @@ public class FileRepository {
         return dbManager.loadAllDocuments();
     }
 
+    public void renameFile(String docId, String newName) throws SQLException {
+        dbManager.renameDocument(docId, newName);
+    }
+
     public void deleteFile(String docId) throws SQLException {
         dbManager.deleteDocument(docId);
     }

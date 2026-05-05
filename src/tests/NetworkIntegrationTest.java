@@ -30,7 +30,7 @@ public class NetworkIntegrationTest {
     public void runAll() throws Exception {
         System.out.println("\n=== Network Integration Test ===");
 
-        WebSocketServer server = new WebSocketServer(PORT);
+        WebSocketServer server = new WebSocketServer(PORT, null);
         server.setReuseAddr(true);
         server.start();
         Thread.sleep(1000);

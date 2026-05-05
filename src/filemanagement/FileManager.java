@@ -4,7 +4,6 @@ import database.FileRepository;
 import crdt.block.BlockCRDT;
 import java.sql.SQLException;
 import java.util.UUID;
-import java.util.List;
 
 public class FileManager {
     private final FileRepository fileRepository;
@@ -18,8 +17,9 @@ public class FileManager {
         String docId = UUID.randomUUID().toString();
         
         // Task 1: Generate two access codes [cite: 76]
-        String editorCode = ShareCodeManager.generateEditorCode();
-        String viewerCode = ShareCodeManager.generateViewerCode();
+        String[] codes    = ShareCodeManager.generateLinkedCodes();
+        String editorCode = codes[0];
+        String viewerCode = codes[1];
         
         // Task 1: Save to database via FileRepository [cite: 76]
         fileRepository.saveFile(docId, name, editorCode, viewerCode, new BlockCRDT());
@@ -33,15 +33,7 @@ public class FileManager {
     }
 
     public void renameFile(String docId, String newName) throws SQLException {
-        // Task 1: Update the name field (Reuse save logic with existing codes) [cite: 78]
-        // Note: You might need to fetch the codes first if your repository doesn't have a rename-only method
-        List<String[]> records = fileRepository.getAllFileRecords();
-        for (String[] rec : records) {
-            if (rec[0].equals(docId)) {
-                fileRepository.saveFile(docId, newName, rec[2], rec[3], fileRepository.loadFile(docId));
-                break;
-            }
-        }
+        fileRepository.renameFile(docId, newName);
     }
 
     public void deleteFile(String docId) throws SQLException {

@@ -20,7 +20,10 @@ public class CharacterCRDT {
         charMap.put(id, newChar);
 
         children.computeIfAbsent(parentID, k -> new ArrayList<>()).add(newChar);
-        children.get(parentID).sort(Comparator.comparing(c -> c.id));
+        // Descending order: higher counter (newer) comes first among siblings.
+        // This ensures a character inserted at position P appears before older
+        // characters that share the same parent, matching visual document order.
+        children.get(parentID).sort((a, b) -> b.id.compareTo(a.id));
 
         if (pendingDeletes.remove(id)) {
             newChar.markDeleted();
@@ -181,32 +184,28 @@ public class CharacterCRDT {
             if (!charMap.containsKey(c.id)) {
                 charMap.put(c.id, c);
                 children.computeIfAbsent(c.parentID, k -> new ArrayList<>()).add(c);
-                children.get(c.parentID).sort(Comparator.comparing(ch -> ch.id));
+                children.get(c.parentID).sort((a, b) -> b.id.compareTo(a.id));
             }
             if (c.isDeleted() || pendingDeletes.remove(c.id)) {
                 charMap.get(c.id).markDeleted();
             }
         }
     }
+
     public void bulkLoadLinear(List<CRDTChar> chars) {
-    clear();
+        clear();
+        CharId newParent = null;
+        for (CRDTChar oldChar : chars) {
+            CRDTChar newChar = new CRDTChar(oldChar.id, oldChar.value, newParent);
+            if (oldChar.isDeleted()) newChar.markDeleted();
+            newChar.setBold(oldChar.isBold());
+            newChar.setItalic(oldChar.isItalic());
 
-    CharId newParent = null;
+            charMap.put(newChar.id, newChar);
+            children.computeIfAbsent(newParent, k -> new ArrayList<>()).add(newChar);
+            children.get(newParent).sort((a, b) -> b.id.compareTo(a.id));
 
-    for (CRDTChar oldChar : chars) {
-        CRDTChar newChar = new CRDTChar(oldChar.id, oldChar.value, newParent);
-
-        if (oldChar.isDeleted()) {
-            newChar.markDeleted();
+            newParent = newChar.id;
         }
-        newChar.setBold(oldChar.isBold());
-        newChar.setItalic(oldChar.isItalic());
-
-        charMap.put(newChar.id, newChar);
-        children.computeIfAbsent(newParent, k -> new ArrayList<>()).add(newChar);
-        children.get(newParent).sort(Comparator.comparing(ch -> ch.id));
-
-        newParent = newChar.id;
     }
- }
 }
