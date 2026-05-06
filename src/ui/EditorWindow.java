@@ -384,10 +384,10 @@ public class EditorWindow extends JFrame {
             updateTitle();
 
             connectToServer(lastServerUrl, sessionId, uid, "editor");
-            // Save the imported content once connected (slight delay for connection)
-            new Timer("import-save", true).schedule(new TimerTask() {
-                @Override public void run() { SwingUtilities.invokeLater(() -> triggerSave()); }
-            }, 1000);
+            // Save immediately when the connection opens so MongoDB has the content
+            // before anyone can join the session via the share code.
+            wsClient.setOnConnectedCallback(() ->
+                SwingUtilities.invokeLater(() -> triggerSave()));
         }));
 
         if (isConnected()) doImport.run();

@@ -201,11 +201,10 @@ public class WebSocketServer extends org.java_websocket.server.WebSocketServer {
                 } catch (Exception ignored) {}
             }
 
-            // Send document state: prefer in-memory history, fall back to MongoDB snapshot
-            List<String> history = session.getOperationHistory();
-            if (!history.isEmpty()) {
-                sendHistory(conn, history);
-            } else if (db != null) {
+            // Step 1 — send the saved MongoDB snapshot as the base state (if one exists).
+            // This ensures imported or previously saved content is always visible to joiners,
+            // even after the host has made additional edits (which are in history, not the snapshot).
+            if (db != null) {
                 try {
                     String crdtJson = db.loadCrdtBySessionId(sessionID);
                     if (crdtJson != null) {
@@ -213,15 +212,15 @@ public class WebSocketServer extends org.java_websocket.server.WebSocketServer {
                         msg.addProperty("action", "documentState");
                         msg.addProperty("crdtJson", crdtJson);
                         conn.send(msg.toString());
-                    } else {
-                        sendHistory(conn, Collections.emptyList());
                     }
-                } catch (Exception e) {
-                    sendHistory(conn, Collections.emptyList());
-                }
-            } else {
-                sendHistory(conn, Collections.emptyList());
+                } catch (Exception ignored) {}
             }
+
+            // Step 2 — replay in-memory operations on top of the snapshot.
+            // CRDT insert is idempotent (duplicate IDs are silently ignored), so operations
+            // that were already in the snapshot are safely skipped by the client CRDT.
+            List<String> history = session.getOperationHistory();
+            sendHistory(conn, history);
 
             broadcastUserList(session, sessionID);
 
@@ -326,7 +325,7 @@ public class WebSocketServer extends org.java_websocket.server.WebSocketServer {
             if (info == null) return;
 
             if (info.role == UserRole.VIEWER) return;
-
+ 
             String crdtJson = json.get("crdtJson").getAsString();
             if (db != null && info.docId != null) {
                 db.saveCRDTState(info.docId, crdtJson);
