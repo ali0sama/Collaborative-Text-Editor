@@ -1,0 +1,127 @@
+================================================================
+  COLLABORATIVE TEXT EDITOR — HOW TO RUN
+================================================================
+
+REQUIREMENTS
+------------
+- Java 17 or higher  (check: java -version)
+- Gradle wrapper is included, no separate Gradle install needed
+
+
+PROJECT STRUCTURE
+-----------------
+src/                  All Java source files
+lib/                  Bundled JAR dependencies
+build.gradle          Build configuration
+ServerLauncher.java   Entry point for the server
+Main.java             Entry point for the UI
+
+
+================================================================
+  SCENARIO 1 — SINGLE MACHINE (local testing)
+================================================================
+
+Open two terminals in the project root folder.
+
+TERMINAL 1 — Start the server:
+  gradlew runServer          (Windows)
+  ./gradlew runServer        (Mac / Linux)
+
+  You should see:
+    Server is READY for connections!
+    Clients should connect to: ws://YOUR_LAN_IP:8081
+
+TERMINAL 2 — Start the editor UI:
+  gradlew runUI              (Windows)
+  ./gradlew runUI            (Mac / Linux)
+
+  A second terminal can launch a second UI instance for testing.
+
+
+================================================================
+  SCENARIO 2 — TWO DIFFERENT MACHINES (LAN collaboration)
+================================================================
+
+MACHINE A (host)
+----------------
+1. Find your local IP address:
+     Windows:  run  ipconfig  and look for IPv4 Address
+     Mac/Linux: run  ifconfig  or  ip addr
+
+2. Start the server:
+     gradlew runServer
+
+3. Start the editor UI:
+     gradlew runUI
+
+4. Create or open a file (File > New File or File > Open File).
+
+5. Click CONNECT in the toolbar.
+   - Server URL:  ws://<YOUR_IP>:8081   (e.g. ws://192.168.1.10:8081)
+   - Session ID:  any shared name, e.g.  mydoc
+   - User ID:     1
+   - Role:        Editor
+   Click Connect.
+
+6. Click SHARE to see your 8-character Editor and Viewer codes.
+   Share one of those codes with the other machine.
+
+
+MACHINE B (guest)
+-----------------
+1. Start the editor UI:
+     gradlew runUI
+
+2. Click JOIN in the toolbar.
+   - Server URL:  ws://<MACHINE_A_IP>:8081
+   - Share code:  the 8-character code you received
+   - Your User ID: 2  (must be different from Machine A's ID)
+   Click Join.
+
+   The app resolves the session automatically and connects.
+   You will receive the full document history from the server.
+
+
+================================================================
+  ROLES EXPLAINED
+================================================================
+
+Editor code  — full read/write access (can type, delete, bold, italic)
+Viewer code  — read-only access (can see edits in real time, cannot type)
+
+
+================================================================
+  RUN THE TEST SUITE
+================================================================
+
+  gradlew runTests           (Windows)
+  ./gradlew runTests         (Mac / Linux)
+
+  Runs all unit and integration tests and prints pass/fail to console.
+
+
+================================================================
+  TROUBLESHOOTING
+================================================================
+
+"Connection refused"
+  - Make sure the server is running on Machine A before connecting.
+  - Check that port 8081 is not blocked by a firewall.
+    Windows: allow it in Windows Defender Firewall > Inbound Rules.
+
+"Code Not Found"
+  - Machine A must be connected to the server BEFORE sharing the code.
+    The server only knows the codes while Machine A is connected.
+  - Both machines must point to the same server URL.
+
+"Database error on startup"
+  - The SQLite database file (collab_editor.db) is created automatically
+    in the folder you run the app from. No setup needed.
+
+"gradlew is not recognized"
+  - Make sure you are in the Collaborative-Text-Editor folder, not the
+    parent folder.
+  - On Windows, use  gradlew  (no ./). On Mac/Linux, use  ./gradlew
+    and run  chmod +x gradlew  first if needed.
+
+================================================================
